@@ -436,15 +436,18 @@ async def lockdown_server(interaction: discord.Interaction):
         return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     locked = 0
-    for channel in interaction.guild.text_channels:
+    targets = [
+        c for c in interaction.guild.channels
+        if isinstance(c, (discord.TextChannel, discord.CategoryChannel))
+    ]
+    for channel in targets:
         overwrite = channel.overwrites_for(interaction.guild.default_role)
-        if overwrite.send_messages is not False:
-            overwrite.send_messages = False
-            try:
-                await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
-                locked += 1
-            except Exception:
-                pass
+        overwrite.send_messages = False
+        try:
+            await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+            locked += 1
+        except Exception:
+            pass
     await interaction.followup.send(
         f"🔒 Fortress protocol activated. **{locked}** channels sealed.", ephemeral=True
     )
