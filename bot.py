@@ -7,11 +7,32 @@ import json
 import time
 import unicodedata
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import timedelta, datetime, timezone
 from collections import defaultdict
 
 TOKEN    = os.environ.get("DISCORD_TOKEN")
 OWNER_ID = 1456572804815261858
+
+# ─── KEEP-ALIVE (for UptimeRobot) ─────────────────────────────────────────────
+
+class _Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Elysian is alive and guarding the library.")
+
+    def log_message(self, *args):
+        pass  # silence default access logs
+
+def _start_keep_alive(port: int = 8080):
+    server = HTTPServer(("0.0.0.0", port), _Ping)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"✧ Keep-alive server running on port {port}")
+
+_start_keep_alive()
 
 # ─── GEMINI ───────────────────────────────────────────────────────────────────
 
