@@ -5,6 +5,7 @@ from discord import app_commands
 import os
 import json
 import time
+import socket
 import unicodedata
 import random
 import threading
@@ -15,7 +16,10 @@ from collections import defaultdict
 TOKEN    = os.environ.get("DISCORD_TOKEN")
 OWNER_ID = 1456572804815261858
 
-# ─── KEEP-ALIVE (for UptimeRobot) ─────────────────────────────────────────────
+# ─── KEEP-ALIVE (UptimeRobot) ─────────────────────────────────────────────────
+
+class _ReuseServer(HTTPServer):
+    allow_reuse_address = True
 
 class _Ping(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -23,12 +27,11 @@ class _Ping(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Elysian is alive and guarding the library.")
-
     def log_message(self, *args):
-        pass  # silence default access logs
+        pass
 
 def _start_keep_alive(port: int = 8080):
-    server = HTTPServer(("0.0.0.0", port), _Ping)
+    server = _ReuseServer(("0.0.0.0", port), _Ping)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"✧ Keep-alive server running on port {port}")
 
@@ -53,6 +56,7 @@ USERS_FILE    = "users.json"
 SHOP_FILE     = "shop.json"
 CONFIG_FILE   = "guild_config.json"
 SESSIONS_FILE = "sessions.json"
+TASKS_FILE    = "tasks.json"
 
 def load_json(path, default):
     if os.path.exists(path):
@@ -69,6 +73,9 @@ users_db    = load_json(USERS_FILE,    {})
 shop_db     = load_json(SHOP_FILE,     {"items": []})
 guild_cfg   = load_json(CONFIG_FILE,   {})
 sessions_db = load_json(SESSIONS_FILE, {})
+tasks_db    = load_json(TASKS_FILE,    {})  # message_id -> task record
+
+# ─── RUNTIME STATE ────────────────────────────────────────────────────────────
 
 invite_cache     = {}
 message_tracker  = defaultdict(list)
@@ -77,12 +84,14 @@ voice_join_times = {}
 pomodoro_tasks   = {}
 deepwork_tasks   = {}
 
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
 HOUR_TIERS = [
     (100, "100h Immortal"),
     (50,  "50h Sage"),
     (10,  "10h Scholar"),
 ]
-TIER_COLORS = {"10h Scholar": 0xC0C0C0, "50h Sage": 0x4169E1, "100h Immortal": 0xFFD700}
+TIER_COLORS   = {"10h Scholar": 0xC0C0C0, "50h Sage": 0x4169E1, "100h Immortal": 0xFFD700}
 HOUR_MILESTONES = [1000, 2500, 5000, 10000]
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -126,6 +135,9 @@ def current_tier(hours: float) -> str:
 
 def streak_icon(s: int) -> str:
     return "🔥🔥" if s >= 7 else ("🔥" if s >= 3 else "")
+
+def is_owner(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == OWNER_ID
 
 async def auto_role(member: discord.Member, hours: float):
     earned = current_tier(hours)
@@ -195,9 +207,6 @@ async def mourn_streak(member: discord.Member, old_streak: int):
     except Exception:
         pass
 
-def is_owner(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == OWNER_ID
-
 # ─── BOT ──────────────────────────────────────────────────────────────────────
 
 class Elysian(commands.Bot):
@@ -206,12 +215,21 @@ class Elysian(commands.Bot):
         super().__init__(command_prefix="e!", intents=intents)
 
     async def setup_hook(self):
+        self.add_view(TaskDoneView())   # register persistent task button
         await self.tree.sync()
         self.passive_ink_task.start()
+        self.daily_task_check.start()
         print("✧ Elysian is online. Guardian of the Library is active. ✧")
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="🏛️ The Library Hall"
+            )
+        )
         for guild in self.guilds:
             try:
                 invites = await guild.fetch_invites()
@@ -230,6 +248,61 @@ class Elysian(commands.Bot):
     @passive_ink_task.before_loop
     async def before_passive_ink(self):
         await self.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def daily_task_check(self):
+        """Every 24 hours, penalise scholars who did not complete their tasks."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        to_remove = []
+        for msg_id, task in tasks_db.items():
+            if task.get("done") or task.get("date") == today:
+                continue
+            uid = task.get("user_id")
+            if not uid:
+                continue
+            data   = get_user(uid)
+            penalty = task.get("ink_stake", 5)
+            data["ink"] = max(0, data["ink"] - penalty)
+            save_json(USERS_FILE, users_db)
+
+            # Try to DM the scholar
+            try:
+                user = await self.fetch_user(int(uid))
+                await user.send(
+                    f"📖 *Scholar, greatness requires discipline.*\n"
+                    f"You did not complete your task: **{task['task']}**\n"
+                    f"**{penalty} Ink** has been deducted from your balance. Rise tomorrow."
+                )
+            except Exception:
+                pass
+
+            # Try to update the original message
+            try:
+                guild = self.get_guild(int(task["guild_id"]))
+                ch    = guild.get_channel(int(task["channel_id"])) if guild else None
+                msg   = await ch.fetch_message(int(msg_id)) if ch else None
+                if msg:
+                    em = msg.embeds[0] if msg.embeds else discord.Embed()
+                    em.color = 0xed4245
+                    em.set_footer(text=f"❌ Not completed — {penalty} Ink deducted.")
+                    await msg.edit(embed=em, view=None)
+            except Exception:
+                pass
+
+            to_remove.append(msg_id)
+
+        for mid in to_remove:
+            tasks_db.pop(mid, None)
+        save_json(TASKS_FILE, tasks_db)
+
+    @daily_task_check.before_loop
+    async def before_daily_check(self):
+        await self.wait_until_ready()
+        # Wait until next midnight UTC
+        now  = datetime.now(timezone.utc)
+        next_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+        await asyncio.sleep((next_midnight - now).total_seconds())
+
 
 bot = Elysian()
 
@@ -451,13 +524,53 @@ async def on_voice_state_update(member, before, after):
         await check_server_milestone(member.guild)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  PERSISTENT VIEWS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TaskDoneView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ Mark as Done", style=discord.ButtonStyle.success, custom_id="task_done_btn", emoji="✅")
+    async def mark_done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg_id = str(interaction.message.id)
+        task   = tasks_db.get(msg_id)
+
+        if not task:
+            return await interaction.response.send_message("This task record no longer exists.", ephemeral=True)
+        if task.get("user_id") != str(interaction.user.id):
+            return await interaction.response.send_message("That's not your task, scholar.", ephemeral=True)
+        if task.get("done"):
+            return await interaction.response.send_message("You already completed this task! 🎉", ephemeral=True)
+
+        task["done"] = True
+        reward = 25
+        data   = get_user(task["user_id"])
+        data["ink"] += reward
+        save_json(USERS_FILE, users_db)
+        save_json(TASKS_FILE, tasks_db)
+
+        await auto_role(interaction.user, data["total_hours"])
+
+        # Update the embed
+        em = interaction.message.embeds[0].copy()
+        em.color = 0x57f287
+        em.set_footer(text=f"✅ Completed — +{reward} Ink rewarded! Total: {data['ink']:,} Ink")
+        button.disabled = True
+        button.label    = "✅ Completed!"
+        await interaction.message.edit(embed=em, view=self)
+
+        await interaction.response.send_message(
+            f"🎉 Task complete! **+{reward} Ink** added to your balance. Keep the momentum going, scholar.",
+            ephemeral=True
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  MODALS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Purge ─────────────────────────────────────────────────────────────────────
 class PurgeModal(discord.ui.Modal, title="🗑️ Cleanse Messages"):
     amount = discord.ui.TextInput(label="Number of messages to delete", placeholder="e.g. 50", max_length=4)
-
     async def on_submit(self, interaction: discord.Interaction):
         try:
             n = int(self.amount.value.strip())
@@ -468,14 +581,11 @@ class PurgeModal(discord.ui.Modal, title="🗑️ Cleanse Messages"):
         await interaction.followup.send(f"Cleansed **{len(deleted)}** messages.", ephemeral=True)
 
 
-# ── Purge User ────────────────────────────────────────────────────────────────
 class PurgeUserModal(discord.ui.Modal, title="🗑️ Cleanse User Messages"):
     amount = discord.ui.TextInput(label="Messages to scan", placeholder="e.g. 100", max_length=4)
-
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         try:
             n = int(self.amount.value.strip())
@@ -486,45 +596,37 @@ class PurgeUserModal(discord.ui.Modal, title="🗑️ Cleanse User Messages"):
         await interaction.followup.send(f"Removed **{len(deleted)}** messages from **{self.target.display_name}**.", ephemeral=True)
 
 
-# ── Slowmode ──────────────────────────────────────────────────────────────────
 class SlowmodeModal(discord.ui.Modal, title="⏱️ Set Slowmode"):
     seconds = discord.ui.TextInput(label="Delay in seconds (0 to disable)", placeholder="e.g. 10", max_length=5)
-
     async def on_submit(self, interaction: discord.Interaction):
         try:
             s = int(self.seconds.value.strip())
         except ValueError:
             return await interaction.response.send_message("Please enter a valid number.", ephemeral=True)
         await interaction.channel.edit(slowmode_delay=s)
-        msg = "⏱️ Slowmode lifted. The flow of time is restored." if s == 0 else f"⏱️ Slowmode set to **{s}s**."
+        msg = "⏱️ Slowmode lifted." if s == 0 else f"⏱️ Slowmode set to **{s}s**."
         await interaction.response.send_message(embed=discord.Embed(description=msg, color=0xffa500))
 
 
-# ── Nuke ──────────────────────────────────────────────────────────────────────
 class NukeModal(discord.ui.Modal, title="🌌 Confirm Channel Nuke"):
     confirm = discord.ui.TextInput(label='Type "NUKE" to confirm', placeholder="NUKE", max_length=4)
-
     async def on_submit(self, interaction: discord.Interaction):
         if self.confirm.value.strip().upper() != "NUKE":
-            return await interaction.response.send_message("Nuke cancelled. Confirmation did not match.", ephemeral=True)
+            return await interaction.response.send_message("Nuke cancelled.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        ch     = interaction.channel
+        ch = interaction.channel
         new_ch = await ch.clone(reason="Elysian Nuke")
         await new_ch.edit(position=ch.position)
         await ch.delete(reason="Elysian Nuke")
         await new_ch.send("🌌 *The library has been purified. A new chapter begins.*", delete_after=12)
 
 
-# ── Mute ──────────────────────────────────────────────────────────────────────
 class MuteModal(discord.ui.Modal, title="🌿 Silence Scholar"):
     minutes = discord.ui.TextInput(label="Duration (minutes)", placeholder="e.g. 10", max_length=4)
-    reason  = discord.ui.TextInput(label="Reason", placeholder="Why are you silencing them?",
-                                   style=discord.TextStyle.paragraph, max_length=500)
-
+    reason  = discord.ui.TextInput(label="Reason", placeholder="Why are you silencing them?", style=discord.TextStyle.paragraph, max_length=500)
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         try:
             m = int(self.minutes.value.strip())
@@ -534,29 +636,21 @@ class MuteModal(discord.ui.Modal, title="🌿 Silence Scholar"):
         try:
             await self.target.timeout(timedelta(minutes=m), reason=reason)
             try:
-                await self.target.send(
-                    f"🌿 You have been moved to the Silent Gardens for: **{reason}**\n"
-                    f"Duration: **{m} minute(s)**. Reflect, and return with clarity."
-                )
+                await self.target.send(f"🌿 Moved to the Silent Gardens for: **{reason}**\nDuration: **{m} minute(s)**.")
             except Exception:
                 pass
             await interaction.response.send_message(embed=discord.Embed(
-                description=f"🌿 {self.target.mention} entered the Silent Gardens for **{m}m**.\nReason: *{reason}*",
-                color=0x7b5ea7
+                description=f"🌿 {self.target.mention} entered the Silent Gardens for **{m}m**.\nReason: *{reason}*", color=0x7b5ea7
             ))
         except discord.Forbidden:
             await interaction.response.send_message("I lack the authority to silence this scholar.", ephemeral=True)
 
 
-# ── Warn ──────────────────────────────────────────────────────────────────────
 class WarnModal(discord.ui.Modal, title="📜 Issue Warning"):
-    reason = discord.ui.TextInput(label="Reason for warning", placeholder="What did they do?",
-                                  style=discord.TextStyle.paragraph, max_length=500)
-
+    reason = discord.ui.TextInput(label="Reason for warning", placeholder="What did they do?", style=discord.TextStyle.paragraph, max_length=500)
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         uid    = str(self.target.id)
         reason = self.reason.value.strip() or "No reason provided"
@@ -565,8 +659,7 @@ class WarnModal(discord.ui.Modal, title="📜 Issue Warning"):
         save_json(WARNS_FILE, warns_db)
         count = len(warns_db[uid]["warnings"])
         await interaction.response.send_message(embed=discord.Embed(
-            description=f"📜 **{self.target.display_name}** received strike #{count}.\nReason: *{reason}*",
-            color=0xffa500
+            description=f"📜 **{self.target.display_name}** received strike #{count}.\nReason: *{reason}*", color=0xffa500
         ))
         try:
             await self.target.send(f"⚠️ Warning in **{interaction.guild.name}**: **{reason}**")
@@ -574,15 +667,11 @@ class WarnModal(discord.ui.Modal, title="📜 Issue Warning"):
             pass
 
 
-# ── Kick ──────────────────────────────────────────────────────────────────────
 class KickModal(discord.ui.Modal, title="👣 Remove Scholar"):
-    reason = discord.ui.TextInput(label="Reason for removal", placeholder="Why are you removing them?",
-                                  style=discord.TextStyle.paragraph, max_length=500, required=False)
-
+    reason = discord.ui.TextInput(label="Reason for removal", placeholder="Why are you removing them?", style=discord.TextStyle.paragraph, max_length=500, required=False)
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         reason = self.reason.value.strip() or "No reason provided"
         try:
@@ -595,15 +684,11 @@ class KickModal(discord.ui.Modal, title="👣 Remove Scholar"):
         ))
 
 
-# ── Ban ───────────────────────────────────────────────────────────────────────
 class BanModal(discord.ui.Modal, title="🔒 Exile Scholar"):
-    reason = discord.ui.TextInput(label="Reason for exile", placeholder="Why are you banning them?",
-                                  style=discord.TextStyle.paragraph, max_length=500, required=False)
-
+    reason = discord.ui.TextInput(label="Reason for exile", placeholder="Why are you banning them?", style=discord.TextStyle.paragraph, max_length=500, required=False)
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         reason = self.reason.value.strip() or "No reason provided"
         try:
@@ -616,14 +701,11 @@ class BanModal(discord.ui.Modal, title="🔒 Exile Scholar"):
         ))
 
 
-# ── Set Ink ───────────────────────────────────────────────────────────────────
 class SetInkModal(discord.ui.Modal, title="💧 Set Ink Balance"):
     amount = discord.ui.TextInput(label="New Ink amount", placeholder="e.g. 500", max_length=10)
-
     def __init__(self, user: discord.Member):
         super().__init__()
         self.target = user
-
     async def on_submit(self, interaction: discord.Interaction):
         try:
             n = int(self.amount.value.strip())
@@ -634,12 +716,9 @@ class SetInkModal(discord.ui.Modal, title="💧 Set Ink Balance"):
         await interaction.response.send_message(f"💧 **{self.target.display_name}**'s Ink set to **{n:,}**.", ephemeral=True)
 
 
-# ── Broadcast ─────────────────────────────────────────────────────────────────
 class BroadcastModal(discord.ui.Modal, title="📣 Elysian Broadcast"):
     b_title   = discord.ui.TextInput(label="Announcement Title", placeholder="Important Notice", max_length=256)
-    b_message = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph,
-                                     placeholder="Write your announcement here...", max_length=2000)
-
+    b_message = discord.ui.TextInput(label="Message", style=discord.TextStyle.paragraph, placeholder="Write your announcement here...", max_length=2000)
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         em = discord.Embed(title=self.b_title.value, description=self.b_message.value, color=0x7B5EA7)
@@ -657,19 +736,15 @@ class BroadcastModal(discord.ui.Modal, title="📣 Elysian Broadcast"):
         await interaction.followup.send(f"📣 Broadcast sent to **{sent}** channels.", ephemeral=True)
 
 
-# ── Focus ─────────────────────────────────────────────────────────────────────
 class FocusModal(discord.ui.Modal, title="📚 Start Focus Session"):
-    topic = discord.ui.TextInput(label="What are you studying?", placeholder="e.g. Mathematics Chapter 5",
-                                 max_length=200, required=False)
-
+    topic = discord.ui.TextInput(label="What are you studying?", placeholder="e.g. Mathematics Chapter 5", max_length=200, required=False)
     async def on_submit(self, interaction: discord.Interaction):
         uid   = str(interaction.user.id)
         topic = self.topic.value.strip() or "Open study"
         if uid in sessions_db:
             elapsed = (time.time() - sessions_db[uid]["start"]) / 60
             return await interaction.response.send_message(
-                f"📚 Already in session: *{sessions_db[uid]['topic']}* — {elapsed:.0f}m in. Use `/endfocus` first.",
-                ephemeral=True
+                f"📚 Already in session: *{sessions_db[uid]['topic']}* — {elapsed:.0f}m in. Use `/endfocus` first.", ephemeral=True
             )
         sessions_db[uid] = {"start": time.time(), "topic": topic}
         save_json(SESSIONS_FILE, sessions_db)
@@ -679,62 +754,44 @@ class FocusModal(discord.ui.Modal, title="📚 Start Focus Session"):
                 await interaction.user.add_roles(study_role)
             except Exception:
                 pass
-        em = discord.Embed(
-            title="📚 Focus Session Started",
-            description=f"**{interaction.user.display_name}** has entered deep focus.\n*Topic: {topic}*",
-            color=0x7B5EA7
-        )
+        em = discord.Embed(title="📚 Focus Session Started", description=f"**{interaction.user.display_name}** has entered deep focus.\n*Topic: {topic}*", color=0x7B5EA7)
         em.set_footer(text="Use /endfocus to end your session and claim your Ink.")
         await interaction.response.send_message(embed=em)
 
 
-# ── Pomodoro ──────────────────────────────────────────────────────────────────
 class PomodoroModal(discord.ui.Modal, title="🍅 Pomodoro Timer"):
     work_m  = discord.ui.TextInput(label="Work duration (minutes)", placeholder="25", max_length=3, default="25")
     break_m = discord.ui.TextInput(label="Break duration (minutes)", placeholder="5",  max_length=3, default="5")
-
     async def on_submit(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
         if uid in pomodoro_tasks:
-            return await interaction.response.send_message("You already have an active Pomodoro. Use `/stoppomodoro` to cancel.", ephemeral=True)
+            return await interaction.response.send_message("Already have an active Pomodoro. Use `/stoppomodoro` to cancel.", ephemeral=True)
         try:
             wm = int(self.work_m.value.strip())
             bm = int(self.break_m.value.strip())
         except ValueError:
             return await interaction.response.send_message("Please enter valid numbers.", ephemeral=True)
-
         study_role = discord.utils.get(interaction.guild.roles, name="📚 Study")
         if study_role:
             try:
                 await interaction.user.add_roles(study_role)
             except Exception:
                 pass
-
         task = asyncio.create_task(_run_pomodoro(interaction.user, interaction.channel, wm, bm))
         pomodoro_tasks[uid] = task
-
-        em = discord.Embed(
-            title="🍅 Pomodoro Started",
-            description=f"**Work:** {wm} minutes\n**Break:** {bm} minutes\n\n*Study role applied. The bot will DM you when it's break time.*",
-            color=0x7B5EA7
-        )
+        em = discord.Embed(title="🍅 Pomodoro Started", description=f"**Work:** {wm} minutes\n**Break:** {bm} minutes\n\n*Study role applied. The bot will DM you when it's break time.*", color=0x7B5EA7)
         em.set_footer(text="Use /stoppomodoro to cancel.")
         await interaction.response.send_message(embed=em)
 
 
-# ── Deep Work ─────────────────────────────────────────────────────────────────
 class DeepWorkModal(discord.ui.Modal, title="🧠 Deep Work Mode"):
     minutes = discord.ui.TextInput(label="How long to hide General Chat (minutes)", placeholder="60", max_length=4, default="60")
-
     async def on_submit(self, interaction: discord.Interaction):
         uid = str(interaction.user.id)
         cfg = gcfg(interaction.guild.id)
         cid = cfg.get("general_channel_id")
         if not cid:
-            return await interaction.response.send_message(
-                "No General Chat configured. Run `/setup_elysian` first, or make sure a channel named `general` exists.",
-                ephemeral=True
-            )
+            return await interaction.response.send_message("No General Chat configured. Run `/elysian_genesis` first.", ephemeral=True)
         ch = interaction.guild.get_channel(cid)
         if not ch:
             return await interaction.response.send_message("General Chat channel not found.", ephemeral=True)
@@ -744,11 +801,9 @@ class DeepWorkModal(discord.ui.Modal, title="🧠 Deep Work Mode"):
             m = int(self.minutes.value.strip())
         except ValueError:
             return await interaction.response.send_message("Please enter a valid number.", ephemeral=True)
-
         ow = ch.overwrites_for(interaction.user)
         ow.read_messages = False
         await ch.set_permissions(interaction.user, overwrite=ow)
-
         async def wait_and_restore():
             await asyncio.sleep(m * 60)
             ow2 = ch.overwrites_for(interaction.user)
@@ -758,58 +813,236 @@ class DeepWorkModal(discord.ui.Modal, title="🧠 Deep Work Mode"):
             except Exception:
                 pass
             try:
-                await interaction.user.send(f"🔓 **Deep Work complete!** You can now see {ch.mention} again. Great work, scholar.")
+                await interaction.user.send(f"🔓 **Deep Work complete!** You can now see {ch.mention} again.")
             except Exception:
                 pass
             deepwork_tasks.pop(uid, None)
-
         deepwork_tasks[uid] = asyncio.create_task(wait_and_restore())
-        em = discord.Embed(
-            title="🧠 Deep Work Mode Activated",
-            description=f"{ch.mention} is now hidden from you for **{m} minutes**.\n\n*The distraction has been sealed. Return to your books, scholar.*",
-            color=0x2f3136
-        )
+        em = discord.Embed(title="🧠 Deep Work Mode Activated", description=f"{ch.mention} is now hidden from you for **{m} minutes**.\n\n*The distraction has been sealed. Return to your books.*", color=0x2f3136)
         em.set_footer(text="The channel restores automatically when the timer ends.")
         await interaction.response.send_message(embed=em, ephemeral=True)
 
 
-# ── Summarize ─────────────────────────────────────────────────────────────────
-class SummarizeModal(discord.ui.Modal, title="🔮 AI Summary"):
-    text = discord.ui.TextInput(label="Paste your text or article below",
-                                style=discord.TextStyle.paragraph,
-                                placeholder="Paste the content you want summarized into 3 key points...",
-                                max_length=4000)
-
+class SummarizeModal(discord.ui.Modal, title="🔮 AI Oracle — Summarize"):
+    text = discord.ui.TextInput(label="Paste your text or article below", style=discord.TextStyle.paragraph,
+                                placeholder="Paste the content you want broken down...", max_length=4000)
     async def on_submit(self, interaction: discord.Interaction):
         if not gemini_model:
-            return await interaction.response.send_message(
-                "🔮 The AI oracle is not yet awakened. Please add a `GEMINI_API_KEY` secret.", ephemeral=True
-            )
+            return await interaction.response.send_message("🔮 The AI oracle is not yet awakened. Please add a `GEMINI_API_KEY` secret.", ephemeral=True)
         await interaction.response.defer()
         try:
-            prompt   = f"Summarize the following text into exactly 3 concise bullet points. Be clear, helpful, and academic in tone:\n\n{self.text.value}"
+            prompt = (
+                "You are the Elysian Oracle, a sophisticated academic assistant. "
+                "Analyze the following text and respond with:\n"
+                "**3 Key Pillars** (the 3 most important concepts, each on its own line starting with ✦)\n"
+                "**5 Key Definitions** (the 5 most important terms, each formatted as **Term** — definition)\n\n"
+                f"Text:\n{self.text.value}"
+            )
             response = gemini_model.generate_content(prompt)
-            em = discord.Embed(title="🔮 AI Summary", description=response.text.strip(), color=0x7B5EA7)
-            em.set_footer(text="Elysian • Powered by Gemini AI")
+            em = discord.Embed(title="🔮 Oracle Analysis", description=response.text.strip(), color=0x7B5EA7)
+            em.set_footer(text="Elysian Oracle • Powered by Gemini AI")
             await interaction.followup.send(embed=em)
         except Exception as e:
             await interaction.followup.send(f"The oracle encountered an error: `{e}`", ephemeral=True)
 
 
-# ── Buy ───────────────────────────────────────────────────────────────────────
+class AskModal(discord.ui.Modal, title="🎓 Ask the Elysian Oracle"):
+    question = discord.ui.TextInput(label="Your academic question", style=discord.TextStyle.paragraph,
+                                    placeholder="Ask anything academic — history, science, literature, maths...", max_length=1000)
+    async def on_submit(self, interaction: discord.Interaction):
+        if not gemini_model:
+            return await interaction.response.send_message("🔮 The AI oracle is not yet awakened. Please add a `GEMINI_API_KEY` secret.", ephemeral=True)
+        await interaction.response.defer()
+        try:
+            prompt = (
+                "You are Elysian, a sophisticated and witty academic tutor who speaks with eloquence and scholarly authority. "
+                "You reside in a prestigious digital library and guide scholars with precise, insightful, slightly witty answers. "
+                "Answer the following academic question in a helpful but characterful way. Be concise but thorough.\n\n"
+                f"Question: {self.question.value}"
+            )
+            response = gemini_model.generate_content(prompt)
+            em = discord.Embed(
+                title=f"🎓 The Oracle Speaks",
+                description=response.text.strip(),
+                color=0x7B5EA7
+            )
+            em.set_author(name=f"Asked by {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
+            em.set_footer(text="Elysian Oracle • Powered by Gemini AI")
+            await interaction.followup.send(embed=em)
+        except Exception as e:
+            await interaction.followup.send(f"The oracle encountered an error: `{e}`", ephemeral=True)
+
+
+class TaskModal(discord.ui.Modal, title="✅ Daily Commitment"):
+    task_text = discord.ui.TextInput(label="Your task for today", placeholder="e.g. Finish Biology Chapter 4, solve 10 math problems", max_length=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        uid  = str(interaction.user.id)
+        cfg  = gcfg(interaction.guild.id)
+        cid  = cfg.get("daily_goals_channel_id") or interaction.channel.id
+        ch   = interaction.guild.get_channel(cid) or interaction.channel
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        # Give initiation Ink
+        data = get_user(uid)
+        data["ink"] += 5
+        save_json(USERS_FILE, users_db)
+
+        em = discord.Embed(
+            title="📋 Scholar's Commitment",
+            description=f"**{interaction.user.display_name}** has committed to:\n\n*{self.task_text.value}*",
+            color=0x7B5EA7
+        )
+        em.set_thumbnail(url=interaction.user.display_avatar.url)
+        em.add_field(name="📅 Date",         value=today,            inline=True)
+        em.add_field(name="💧 Ink on Entry", value="+5 (initiation)", inline=True)
+        em.add_field(name="🏆 Reward",       value="+25 Ink on completion", inline=True)
+        em.set_footer(text="Click the button below when you've completed this task.")
+
+        view = TaskDoneView()
+        msg  = await ch.send(embed=em, view=view)
+
+        # Store the task
+        tasks_db[str(msg.id)] = {
+            "task":       self.task_text.value,
+            "user_id":    uid,
+            "guild_id":   str(interaction.guild.id),
+            "channel_id": str(ch.id),
+            "message_id": str(msg.id),
+            "done":       False,
+            "date":       today,
+            "ink_stake":  10,
+        }
+        save_json(TASKS_FILE, tasks_db)
+
+        await interaction.response.send_message(
+            f"✅ Commitment logged! **+5 Ink** for starting. Complete it for **+25 more Ink**.", ephemeral=True
+        )
+
+
+class ResourceModal(discord.ui.Modal, title="📚 Submit Resource"):
+    subject  = discord.ui.TextInput(label="Subject",       placeholder="e.g. Biology, Mathematics, History", max_length=100)
+    topic    = discord.ui.TextInput(label="Topic",         placeholder="e.g. Cell Division, Integration, WW2", max_length=100)
+    res_type = discord.ui.TextInput(label="Type",          placeholder="Article / Video / PDF / Notes / Tool", max_length=50)
+    link     = discord.ui.TextInput(label="Link / Source", placeholder="https://...", max_length=500)
+    summary  = discord.ui.TextInput(label="Summary",       placeholder="What does this resource cover? Why is it useful?",
+                                    style=discord.TextStyle.paragraph, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        cfg = gcfg(interaction.guild.id)
+        cid = cfg.get("resource_vault_channel_id")
+        ch  = interaction.guild.get_channel(cid) if cid else interaction.channel
+
+        em = discord.Embed(
+            title=f"📚 {self.subject.value} — {self.topic.value}",
+            description=self.summary.value,
+            color=0xFFD700
+        )
+        em.add_field(name="📂 Subject",  value=self.subject.value,  inline=True)
+        em.add_field(name="🏷️ Topic",   value=self.topic.value,     inline=True)
+        em.add_field(name="📄 Type",     value=self.res_type.value,  inline=True)
+        em.add_field(name="🔗 Source",   value=self.link.value,      inline=False)
+        em.set_author(name=f"Curated by {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
+        em.set_footer(text="Elysian Resource Vault • Curated Knowledge")
+        em.timestamp = discord.utils.utcnow()
+
+        await ch.send(embed=em)
+        await interaction.response.send_message(f"✅ Resource submitted to {ch.mention}. The library grows.", ephemeral=True)
+
+
+class WelcomeGoodbyeModal(discord.ui.Modal):
+    title_field  = discord.ui.TextInput(label="Embed Title", placeholder="Welcome to {server.name}!", max_length=256)
+    desc_field   = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph,
+                                        placeholder="Hey {user.mention}! We now have {server.members} members.", max_length=2048)
+    color_field  = discord.ui.TextInput(label="Color (hex)", placeholder="7B5EA7", max_length=6, required=False)
+    footer_field = discord.ui.TextInput(label="Footer Text", placeholder="Optional footer...", required=False, max_length=200)
+    image_field  = discord.ui.TextInput(label="Image URL",   placeholder="https://...", required=False)
+    def __init__(self, mode: str):
+        self._mode = mode
+        super().__init__(title=f"Set {mode.title()} Message")
+    async def on_submit(self, interaction: discord.Interaction):
+        gcfg(interaction.guild.id)[f"{self._mode}_template"] = {
+            "title":       self.title_field.value,
+            "description": self.desc_field.value,
+            "color":       self.color_field.value.strip().lstrip("#") or ("7B5EA7" if self._mode=="welcome" else "ed4245"),
+            "footer":      self.footer_field.value,
+            "image":       self.image_field.value.strip(),
+        }
+        save_json(CONFIG_FILE, guild_cfg)
+        await interaction.response.send_message(
+            f"✅ {self._mode.title()} message saved!\nVariables: `{{user.name}}` `{{user.mention}}` `{{server.name}}` `{{server.members}}`",
+            ephemeral=True
+        )
+
+
+class TemplateSaveModal(discord.ui.Modal):
+    tmpl_title  = discord.ui.TextInput(label="Title",          placeholder="Enter title...", max_length=256)
+    tmpl_desc   = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, placeholder="Supports {user.name} etc.", max_length=2048)
+    tmpl_color  = discord.ui.TextInput(label="Color (hex)",    placeholder="7B5EA7", max_length=6, required=False)
+    tmpl_footer = discord.ui.TextInput(label="Footer",         placeholder="Optional...", required=False, max_length=200)
+    tmpl_image  = discord.ui.TextInput(label="Image URL",      placeholder="https://...", required=False)
+    def __init__(self, name: str):
+        self._name = name
+        super().__init__(title=f"Save: {name[:40]}")
+    async def on_submit(self, interaction: discord.Interaction):
+        gcfg(interaction.guild.id).setdefault("templates", {})[self._name] = {
+            "title":       self.tmpl_title.value,
+            "description": self.tmpl_desc.value,
+            "color":       self.tmpl_color.value.strip().lstrip("#") or "7B5EA7",
+            "footer":      self.tmpl_footer.value,
+            "image":       self.tmpl_image.value.strip(),
+        }
+        save_json(CONFIG_FILE, guild_cfg)
+        await interaction.response.send_message(f"✅ Template **{self._name}** saved.", ephemeral=True)
+
+
+class EmbedBuilderModal(discord.ui.Modal, title="✨ Elysian Embed Builder"):
+    e_title  = discord.ui.TextInput(label="Title",       placeholder="Enter a title...", max_length=256)
+    e_desc   = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, placeholder="Write your message...", max_length=2048)
+    e_color  = discord.ui.TextInput(label="Color (hex)", placeholder="7B5EA7", max_length=6, required=False)
+    e_footer = discord.ui.TextInput(label="Footer Text", placeholder="Optional...", required=False, max_length=200)
+    e_image  = discord.ui.TextInput(label="Image URL",   placeholder="https://...", required=False)
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            color = int(self.e_color.value.strip().lstrip("#") or "7B5EA7", 16)
+        except ValueError:
+            color = 0x7B5EA7
+        em = discord.Embed(title=fill_vars(self.e_title.value, interaction.user), description=fill_vars(self.e_desc.value, interaction.user), color=color)
+        if self.e_footer.value:
+            em.set_footer(text=fill_vars(self.e_footer.value, interaction.user))
+        if self.e_image.value.strip():
+            em.set_image(url=self.e_image.value.strip())
+        await interaction.response.send_message(embed=em)
+
+
+class AddItemModal(discord.ui.Modal, title="🛍️ Add Shop Item"):
+    item_name  = discord.ui.TextInput(label="Item name",       placeholder="e.g. Study Color — Lavender", max_length=100)
+    item_price = discord.ui.TextInput(label="Price (Ink)",     placeholder="e.g. 200", max_length=6)
+    item_role  = discord.ui.TextInput(label="Role name to grant", placeholder="Exact Discord role name", max_length=100)
+    item_desc  = discord.ui.TextInput(label="Description",     placeholder="Short description", style=discord.TextStyle.paragraph, max_length=300, required=False)
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            price = int(self.item_price.value.strip())
+        except ValueError:
+            return await interaction.response.send_message("Price must be a number.", ephemeral=True)
+        role = discord.utils.get(interaction.guild.roles, name=self.item_role.value.strip())
+        if not role:
+            return await interaction.response.send_message(f"No role named **{self.item_role.value.strip()}** found.", ephemeral=True)
+        shop_db["items"].append({"name": self.item_name.value.strip(), "price": price, "role_id": role.id, "description": self.item_desc.value.strip()})
+        save_json(SHOP_FILE, shop_db)
+        await interaction.response.send_message(f"✅ **{self.item_name.value.strip()}** added for **{price:,} Ink** → {role.mention}.", ephemeral=True)
+
+
 class BuyModal(discord.ui.Modal, title="🛍️ Purchase Item"):
     item_name = discord.ui.TextInput(label="Item name", placeholder="Type the exact item name from /shop", max_length=100)
-
     async def on_submit(self, interaction: discord.Interaction):
         name = self.item_name.value.strip()
         item = next((i for i in shop_db.get("items",[]) if i["name"].lower() == name.lower()), None)
         if not item:
-            return await interaction.response.send_message(f"No item named **{name}**. Check `/shop` for the full list.", ephemeral=True)
+            return await interaction.response.send_message(f"No item named **{name}**. Check `/shop`.", ephemeral=True)
         data = get_user(str(interaction.user.id))
         if data["ink"] < item["price"]:
-            return await interaction.response.send_message(
-                f"Not enough Ink. You have **{data['ink']:,}**, this costs **{item['price']:,}**.", ephemeral=True
-            )
+            return await interaction.response.send_message(f"Not enough Ink. You have **{data['ink']:,}**, need **{item['price']:,}**.", ephemeral=True)
         data["ink"] -= item["price"]
         save_json(USERS_FILE, users_db)
         role = interaction.guild.get_role(item.get("role_id",0))
@@ -824,144 +1057,82 @@ class BuyModal(discord.ui.Modal, title="🛍️ Purchase Item"):
             em.add_field(name="🎭 Role Granted", value=role.mention)
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-
-# ── Add Shop Item ─────────────────────────────────────────────────────────────
-class AddItemModal(discord.ui.Modal, title="🛍️ Add Shop Item"):
-    item_name = discord.ui.TextInput(label="Item name", placeholder="e.g. Study Color — Lavender", max_length=100)
-    item_price = discord.ui.TextInput(label="Price (Ink)", placeholder="e.g. 200", max_length=6)
-    item_role  = discord.ui.TextInput(label="Role name to grant", placeholder="Exact Discord role name", max_length=100)
-    item_desc  = discord.ui.TextInput(label="Description", placeholder="Short description of this item",
-                                      style=discord.TextStyle.paragraph, max_length=300, required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            price = int(self.item_price.value.strip())
-        except ValueError:
-            return await interaction.response.send_message("Price must be a number.", ephemeral=True)
-        role = discord.utils.get(interaction.guild.roles, name=self.item_role.value.strip())
-        if not role:
-            return await interaction.response.send_message(
-                f"No role named **{self.item_role.value.strip()}** found. Make sure the role exists first.", ephemeral=True
-            )
-        shop_db["items"].append({
-            "name": self.item_name.value.strip(),
-            "price": price,
-            "role_id": role.id,
-            "description": self.item_desc.value.strip()
-        })
-        save_json(SHOP_FILE, shop_db)
-        await interaction.response.send_message(
-            f"✅ **{self.item_name.value.strip()}** added for **{price:,} Ink** → {role.mention}.", ephemeral=True
-        )
-
-
-# ── Welcome / Goodbye ─────────────────────────────────────────────────────────
-class WelcomeGoodbyeModal(discord.ui.Modal):
-    title_field = discord.ui.TextInput(label="Embed Title", placeholder="Welcome to {server.name}!", max_length=256)
-    desc_field  = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph,
-                                       placeholder="Hey {user.mention}! We now have {server.members} members.", max_length=2048)
-    color_field = discord.ui.TextInput(label="Color (hex)", placeholder="7B5EA7", max_length=6, required=False)
-    footer_field= discord.ui.TextInput(label="Footer Text", placeholder="Optional footer...", required=False, max_length=200)
-    image_field = discord.ui.TextInput(label="Image URL",   placeholder="https://...", required=False)
-
-    def __init__(self, mode: str):
-        self._mode = mode
-        super().__init__(title=f"Set {mode.title()} Message")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        gcfg(interaction.guild.id)[f"{self._mode}_template"] = {
-            "title":       self.title_field.value,
-            "description": self.desc_field.value,
-            "color":       self.color_field.value.strip().lstrip("#") or ("7B5EA7" if self._mode=="welcome" else "ed4245"),
-            "footer":      self.footer_field.value,
-            "image":       self.image_field.value.strip(),
-        }
-        save_json(CONFIG_FILE, guild_cfg)
-        await interaction.response.send_message(
-            f"✅ {self._mode.title()} message saved!\n"
-            f"Variables: `{{user.name}}` `{{user.mention}}` `{{server.name}}` `{{server.members}}`",
-            ephemeral=True
-        )
-
-
-# ── Template Save ─────────────────────────────────────────────────────────────
-class TemplateSaveModal(discord.ui.Modal):
-    tmpl_title  = discord.ui.TextInput(label="Title",          placeholder="Enter title...", max_length=256)
-    tmpl_desc   = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph,
-                                       placeholder="Supports {user.name}, {server.name} etc.", max_length=2048)
-    tmpl_color  = discord.ui.TextInput(label="Color (hex)",    placeholder="7B5EA7", max_length=6, required=False)
-    tmpl_footer = discord.ui.TextInput(label="Footer",         placeholder="Optional...", required=False, max_length=200)
-    tmpl_image  = discord.ui.TextInput(label="Image URL",      placeholder="https://...", required=False)
-
-    def __init__(self, name: str):
-        self._name = name
-        super().__init__(title=f"Save: {name[:40]}")
-
-    async def on_submit(self, interaction: discord.Interaction):
-        gcfg(interaction.guild.id).setdefault("templates", {})[self._name] = {
-            "title":       self.tmpl_title.value,
-            "description": self.tmpl_desc.value,
-            "color":       self.tmpl_color.value.strip().lstrip("#") or "7B5EA7",
-            "footer":      self.tmpl_footer.value,
-            "image":       self.tmpl_image.value.strip(),
-        }
-        save_json(CONFIG_FILE, guild_cfg)
-        await interaction.response.send_message(f"✅ Template **{self._name}** saved.", ephemeral=True)
-
-
-# ── Embed Builder ─────────────────────────────────────────────────────────────
-class EmbedBuilderModal(discord.ui.Modal, title="✨ Elysian Embed Builder"):
-    e_title  = discord.ui.TextInput(label="Title",       placeholder="Enter a title...", max_length=256)
-    e_desc   = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph,
-                                    placeholder="Write your message... Supports {user.name} etc.", max_length=2048)
-    e_color  = discord.ui.TextInput(label="Color (hex)", placeholder="7B5EA7", max_length=6, required=False)
-    e_footer = discord.ui.TextInput(label="Footer Text", placeholder="Optional...", required=False, max_length=200)
-    e_image  = discord.ui.TextInput(label="Image URL",   placeholder="https://...", required=False)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            color = int(self.e_color.value.strip().lstrip("#") or "7B5EA7", 16)
-        except ValueError:
-            color = 0x7B5EA7
-        em = discord.Embed(
-            title=fill_vars(self.e_title.value, interaction.user),
-            description=fill_vars(self.e_desc.value, interaction.user),
-            color=color
-        )
-        if self.e_footer.value:
-            em.set_footer(text=fill_vars(self.e_footer.value, interaction.user))
-        if self.e_image.value.strip():
-            em.set_image(url=self.e_image.value.strip())
-        await interaction.response.send_message(embed=em)
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SLASH COMMANDS — all open a modal, zero typing required
+#  SLASH COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── GENESIS ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="setup_elysian", description="Elysian: One-time server setup.")
-async def setup_elysian(interaction: discord.Interaction):
+
+@bot.tree.command(name="elysian_genesis", description="Elysian: Build the full Library Hall server structure automatically.")
+async def elysian_genesis(interaction: discord.Interaction):
     if not is_owner(interaction):
         return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     cfg   = gcfg(guild.id)
 
-    cat = discord.utils.get(guild.categories, name="✧ ELYSIAN PRESTIGE ✧") or \
-          await guild.create_category("✧ ELYSIAN PRESTIGE ✧")
-
+    # ── Roles ──────────────────────────────────────────────────────
     role_specs = [
         ("10h Scholar",              discord.Color.from_str("#C0C0C0")),
         ("50h Sage",                 discord.Color.from_str("#4169E1")),
         ("100h Immortal",            discord.Color.from_str("#FFD700")),
+        ("Honor Society",            discord.Color.from_str("#E74C3C")),
         ("Library VIP",              discord.Color.from_str("#9B59B6")),
         ("The Architect's Favorite", discord.Color.from_str("#FF8C00")),
-        ("Elite Monthly Rank",       discord.Color.from_str("#FF69B4")),
         ("📚 Study",                  discord.Color.from_str("#7B5EA7")),
     ]
     for name, color in role_specs:
         if not discord.utils.get(guild.roles, name=name):
             await guild.create_role(name=name, color=color, reason="Elysian Genesis")
+
+    # ── Category: 🏁 START HERE ────────────────────────────────────
+    cat_start = discord.utils.get(guild.categories, name="🏁 START HERE") or \
+                await guild.create_category("🏁 START HERE")
+
+    rules_ch = discord.utils.get(guild.text_channels, name="📜-rules-and-info") or \
+               await guild.create_text_channel("📜-rules-and-info", category=cat_start)
+    announce_ch = discord.utils.get(guild.text_channels, name="📢-announcements") or \
+                  await guild.create_text_channel("📢-announcements", category=cat_start)
+    cfg["welcome_channel_id"] = rules_ch.id
+
+    # ── Category: 📝 THE STUDY HALL ────────────────────────────────
+    cat_study = discord.utils.get(guild.categories, name="📝 THE STUDY HALL") or \
+                await guild.create_category("📝 THE STUDY HALL")
+
+    general_ch = discord.utils.get(guild.text_channels, name="💬-general-study") or \
+                 await guild.create_text_channel("💬-general-study", category=cat_study)
+    goals_ch = discord.utils.get(guild.text_channels, name="✅daily-goals") or \
+               await guild.create_text_channel("✅daily-goals", category=cat_study)
+    resource_ch = discord.utils.get(guild.text_channels, name="📚resource-vault") or \
+                  await guild.create_text_channel("📚resource-vault", category=cat_study)
+    bot_ch = discord.utils.get(guild.text_channels, name="🤖bot-commands") or \
+             await guild.create_text_channel("🤖bot-commands", category=cat_study)
+    pomo_ch = discord.utils.get(guild.text_channels, name="🍅pomodoro-bot") or \
+              await guild.create_text_channel("🍅pomodoro-bot", category=cat_study)
+
+    cfg["general_channel_id"]       = general_ch.id
+    cfg["daily_goals_channel_id"]   = goals_ch.id
+    cfg["resource_vault_channel_id"]= resource_ch.id
+
+    # ── Category: 🔇 FOCUS ZONES ───────────────────────────────────
+    cat_focus = discord.utils.get(guild.categories, name="🔇 FOCUS ZONES") or \
+                await guild.create_category("🔇 FOCUS ZONES")
+
+    lofi_vc = discord.utils.get(guild.voice_channels, name="🎧lofi-library") or \
+              await guild.create_voice_channel("🎧lofi-library", category=cat_focus)
+    cam_vc  = discord.utils.get(guild.voice_channels, name="🎥cam-study") or \
+              await guild.create_voice_channel("🎥cam-study", category=cat_focus)
+    break_vc= discord.utils.get(guild.voice_channels, name="☕the-breakroom") or \
+              await guild.create_voice_channel("☕the-breakroom", category=cat_focus)
+
+    cfg.setdefault("study_vc_ids", [])
+    for vc in [lofi_vc, cam_vc]:
+        if vc.id not in cfg["study_vc_ids"]:
+            cfg["study_vc_ids"].append(vc.id)
+
+    # ── Category: ✧ ELYSIAN PRESTIGE ✧ ────────────────────────────
+    cat_pres = discord.utils.get(guild.categories, name="✧ ELYSIAN PRESTIGE ✧") or \
+               await guild.create_category("✧ ELYSIAN PRESTIGE ✧")
 
     vault_ch = discord.utils.get(guild.text_channels, name="vault-logs")
     if not vault_ch:
@@ -972,101 +1143,81 @@ async def setup_elysian(interaction: discord.Interaction):
         owner = guild.get_member(OWNER_ID)
         if owner:
             ow[owner] = discord.PermissionOverwrite(read_messages=True, send_messages=False)
-        vault_ch = await guild.create_text_channel("vault-logs", category=cat, overwrites=ow)
+        vault_ch = await guild.create_text_channel("vault-logs", category=cat_pres, overwrites=ow)
     cfg["vault_channel_id"] = vault_ch.id
 
     shop_ch = discord.utils.get(guild.text_channels, name="elysian-shop") or \
-              await guild.create_text_channel("elysian-shop", category=cat)
-    cfg["shop_channel_id"] = shop_ch.id
-
-    lb_ch = discord.utils.get(guild.text_channels, name="leaderboard-hall") or \
-            await guild.create_text_channel("leaderboard-hall", category=cat)
+              await guild.create_text_channel("elysian-shop", category=cat_pres)
+    lb_ch   = discord.utils.get(guild.text_channels, name="leaderboard-hall") or \
+              await guild.create_text_channel("leaderboard-hall", category=cat_pres)
+    cfg["shop_channel_id"]        = shop_ch.id
     cfg["leaderboard_channel_id"] = lb_ch.id
 
-    welcome_ch = discord.utils.get(guild.text_channels, name="welcome") or \
-                 await guild.create_text_channel("welcome", category=cat)
-    cfg["welcome_channel_id"] = welcome_ch.id
-
-    study_vc = discord.utils.get(guild.voice_channels, name="📚 Study Hall") or \
-               await guild.create_voice_channel("📚 Study Hall", category=cat)
-    cfg.setdefault("study_vc_ids", [])
-    if study_vc.id not in cfg["study_vc_ids"]:
-        cfg["study_vc_ids"].append(study_vc.id)
-
-    for ch in guild.text_channels:
-        if ch.name in ("general", "general-chat", "chat"):
-            cfg["general_channel_id"] = ch.id
-            break
-
     save_json(CONFIG_FILE, guild_cfg)
-    em = discord.Embed(title="✧ Elysian Genesis Complete ✧", description="The library has been established.", color=0x7B5EA7)
-    em.add_field(name="📂 Category", value="✧ ELYSIAN PRESTIGE ✧", inline=False)
-    em.add_field(name="🎭 Roles",    value="\n".join(f"• {n}" for n, _ in role_specs), inline=True)
-    em.add_field(name="📋 Channels", value=f"• {vault_ch.mention}\n• {shop_ch.mention}\n• {lb_ch.mention}\n• {welcome_ch.mention}", inline=True)
-    em.add_field(name="🎙️ Study VC", value=study_vc.mention, inline=False)
-    em.set_footer(text="Elysian Prestige System")
+
+    em = discord.Embed(title="✧ Elysian Library Hall — Genesis Complete ✧", color=0x7B5EA7,
+                       description="The full server infrastructure has been built.")
+    em.add_field(name="🏁 START HERE",    value=f"• {rules_ch.mention}\n• {announce_ch.mention}",                                          inline=False)
+    em.add_field(name="📝 STUDY HALL",   value=f"• {general_ch.mention}\n• {goals_ch.mention}\n• {resource_ch.mention}\n• {bot_ch.mention}\n• {pomo_ch.mention}", inline=False)
+    em.add_field(name="🔇 FOCUS ZONES",  value=f"• 🎧 lofi-library (VC)\n• 🎥 cam-study (VC)\n• ☕ the-breakroom (VC)",                    inline=False)
+    em.add_field(name="✧ PRESTIGE",      value=f"• {vault_ch.mention}\n• {shop_ch.mention}\n• {lb_ch.mention}",                            inline=False)
+    em.add_field(name="🎭 Roles Created", value="\n".join(f"• {n}" for n, _ in role_specs),                                                 inline=False)
+    em.set_footer(text="Elysian Prestige System • The Library Hall is open.")
     await interaction.followup.send(embed=em, ephemeral=True)
 
 # ─── CLEANSE ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="purge", description="Elysian: Delete recent messages — opens a form.")
+
+@bot.tree.command(name="purge",      description="Elysian: Delete recent messages — opens a form.")
 async def purge(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(PurgeModal())
 
 @bot.tree.command(name="purge_user", description="Elysian: Delete messages from a specific user.")
 @app_commands.describe(user="The user to cleanse")
 async def purge_user(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(PurgeUserModal(user))
 
-@bot.tree.command(name="nuke", description="Elysian: Wipe and recreate this channel.")
+@bot.tree.command(name="nuke",       description="Elysian: Wipe and recreate this channel.")
 async def nuke(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(NukeModal())
 
-@bot.tree.command(name="slowmode", description="Elysian: Set slowmode delay — opens a form.")
+@bot.tree.command(name="slowmode",   description="Elysian: Set slowmode delay — opens a form.")
 async def slowmode(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(SlowmodeModal())
 
 # ─── SILENCE ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="mute", description="Elysian: Silence a scholar — opens a form.")
+
+@bot.tree.command(name="mute",     description="Elysian: Silence a scholar — opens a form.")
 @app_commands.describe(user="The scholar to silence")
 async def mute(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(MuteModal(user))
 
-@bot.tree.command(name="warn", description="Elysian: Issue a warning — opens a form.")
+@bot.tree.command(name="warn",     description="Elysian: Issue a warning — opens a form.")
 @app_commands.describe(user="The scholar to warn")
 async def warn(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WarnModal(user))
 
-@bot.tree.command(name="kick", description="Elysian: Remove a scholar — opens a form.")
+@bot.tree.command(name="kick",     description="Elysian: Remove a scholar — opens a form.")
 @app_commands.describe(user="The scholar to remove")
 async def kick(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(KickModal(user))
 
-@bot.tree.command(name="ban", description="Elysian: Exile a scholar permanently — opens a form.")
+@bot.tree.command(name="ban",      description="Elysian: Exile a scholar permanently — opens a form.")
 @app_commands.describe(user="The scholar to exile")
 async def ban(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(BanModal(user))
 
 @bot.tree.command(name="warnings", description="Elysian: View a scholar's warning record.")
 @app_commands.describe(user="The scholar to inspect")
 async def warnings(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     uid = str(user.id)
     if uid not in warns_db or not warns_db[uid]["warnings"]:
         return await interaction.response.send_message(f"📖 **{user.display_name}**'s record is pristine.", ephemeral=True)
@@ -1079,10 +1230,10 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 # ─── FORTRESS ─────────────────────────────────────────────────────────────────
-@bot.tree.command(name="lock", description="Elysian: Freeze the current channel.")
+
+@bot.tree.command(name="lock",            description="Elysian: Freeze the current channel.")
 async def lock(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     ow = interaction.channel.overwrites_for(interaction.guild.default_role)
     ow.send_messages = False
     await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
@@ -1090,8 +1241,7 @@ async def lock(interaction: discord.Interaction):
 
 @bot.tree.command(name="lockdown_server", description="Elysian: Freeze every public channel at once.")
 async def lockdown_server(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     locked = 0
     for ch in interaction.guild.channels:
@@ -1105,50 +1255,44 @@ async def lockdown_server(interaction: discord.Interaction):
                 pass
     await interaction.followup.send(f"🔒 Fortress activated. **{locked}** channels sealed.", ephemeral=True)
 
-@bot.tree.command(name="unlock", description="Elysian: Restore the flow to the current channel.")
+@bot.tree.command(name="unlock",          description="Elysian: Restore the flow to the current channel.")
 async def unlock(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     ow = interaction.channel.overwrites_for(interaction.guild.default_role)
     ow.send_messages = True
     await interaction.channel.set_permissions(interaction.guild.default_role, overwrite=ow)
     await interaction.response.send_message(embed=discord.Embed(description="🔓 *The gates are open. The library welcomes all scholars.*", color=0x57f287))
 
 # ─── ARCHITECT ────────────────────────────────────────────────────────────────
-@bot.tree.command(name="set_ink", description="Elysian: Manually set a user's Ink — opens a form.")
+
+@bot.tree.command(name="set_ink",   description="Elysian: Set a user's Ink balance — opens a form.")
 @app_commands.describe(user="The scholar")
 async def set_ink(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(SetInkModal(user))
 
 @bot.tree.command(name="broadcast", description="Elysian: Broadcast an announcement — opens a form.")
 async def broadcast(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(BroadcastModal())
 
 @bot.tree.command(name="vault_view", description="Elysian: View a summary of vault events.")
 async def vault_view(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     em = discord.Embed(title="👁️ Vault Summary", color=0x7B5EA7)
     total_warns = sum(len(v.get("warnings",[])) for v in warns_db.values())
-    em.add_field(name="⚠️ Total Warnings",   value=str(total_warns),    inline=True)
-    em.add_field(name="👥 Scholars on File",  value=str(len(warns_db)), inline=True)
-    recent = sorted(
-        [(d.get("username",uid), w["reason"], w.get("timestamp","")[:10])
-         for uid, d in warns_db.items() for w in d.get("warnings",[])],
-        key=lambda x: x[2], reverse=True
-    )[:5]
+    em.add_field(name="⚠️ Total Warnings",  value=str(total_warns),    inline=True)
+    em.add_field(name="👥 Scholars on File", value=str(len(warns_db)), inline=True)
+    recent = sorted([(d.get("username",uid), w["reason"], w.get("timestamp","")[:10])
+                     for uid, d in warns_db.items() for w in d.get("warnings",[])], key=lambda x: x[2], reverse=True)[:5]
     em.add_field(name="📋 Recent Warnings",
-                 value="\n".join(f"• **{u}** — {r} `{ts}`" for u,r,ts in recent) or "None.",
-                 inline=False)
+                 value="\n".join(f"• **{u}** — {r} `{ts}`" for u,r,ts in recent) or "None.", inline=False)
     em.set_footer(text="Elysian Vault • Summary")
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 # ─── SCHOLAR ──────────────────────────────────────────────────────────────────
-@bot.tree.command(name="profile", description="Elysian: View your scholar profile card.")
+
+@bot.tree.command(name="profile",     description="Elysian: View your scholar profile card.")
 @app_commands.describe(user="Scholar to view (leave blank for yourself)")
 async def profile(interaction: discord.Interaction, user: discord.Member = None):
     target = user or interaction.user
@@ -1184,16 +1328,15 @@ async def leaderboard(interaction: discord.Interaction):
         name  = m.display_name if m else "Scholar"
         hours = d.get("total_hours",0)
         s     = d.get("streak",0)
-        tier  = current_tier(hours)
         em.add_field(
             name=f"{medals[i]} #{i+1} — {name} {streak_icon(s)}",
-            value=f"⏱️ `{hours:.1f}h` • 💧 `{d.get('ink',0):,} Ink` • 🎓 {tier}" + (f" • 🔥 {s}d" if s>=3 else ""),
+            value=f"⏱️ `{hours:.1f}h` • 💧 `{d.get('ink',0):,} Ink` • 🎓 {current_tier(hours)}" + (f" • 🔥 {s}d" if s>=3 else ""),
             inline=False
         )
     em.set_footer(text=f"Total server hours: {server_total_hours():.1f}h • Elysian Prestige")
     await interaction.followup.send(embed=em)
 
-@bot.tree.command(name="daily", description="Elysian: Collect your daily Ink blessing.")
+@bot.tree.command(name="daily",       description="Elysian: Collect your daily Ink blessing.")
 async def daily(interaction: discord.Interaction):
     data  = get_user(str(interaction.user.id))
     today = datetime.now(timezone.utc).date().isoformat()
@@ -1208,11 +1351,13 @@ async def daily(interaction: discord.Interaction):
     em.set_footer(text="Return tomorrow for another blessing.")
     await interaction.response.send_message(embed=em)
 
-@bot.tree.command(name="focus", description="Elysian: Start a focus session — opens a form.")
+# ─── FOCUS & POMODORO ─────────────────────────────────────────────────────────
+
+@bot.tree.command(name="focus",        description="Elysian: Start a focus session — opens a form.")
 async def focus(interaction: discord.Interaction):
     await interaction.response.send_modal(FocusModal())
 
-@bot.tree.command(name="endfocus", description="Elysian: End your focus session and claim Ink.")
+@bot.tree.command(name="endfocus",     description="Elysian: End your focus session and claim Ink.")
 async def endfocus(interaction: discord.Interaction):
     uid = str(interaction.user.id)
     if uid not in sessions_db:
@@ -1255,7 +1400,7 @@ async def endfocus(interaction: discord.Interaction):
     em.set_footer(text="Elysian Prestige System")
     await interaction.response.send_message(embed=em)
 
-@bot.tree.command(name="pomodoro", description="Elysian: Start a Pomodoro timer — opens a form.")
+@bot.tree.command(name="pomodoro",     description="Elysian: Start a Pomodoro timer — opens a form.")
 async def pomodoro(interaction: discord.Interaction):
     await interaction.response.send_modal(PomodoroModal())
 
@@ -1274,45 +1419,59 @@ async def stoppomodoro(interaction: discord.Interaction):
             pass
     await interaction.response.send_message("🍅 Pomodoro stopped.", ephemeral=True)
 
-@bot.tree.command(name="deepwork", description="Elysian: Hide General Chat for focused study — opens a form.")
+@bot.tree.command(name="deepwork",     description="Elysian: Hide General Chat for focused study — opens a form.")
 async def deepwork(interaction: discord.Interaction):
     await interaction.response.send_modal(DeepWorkModal())
 
-@bot.tree.command(name="summarize", description="Elysian: AI-summarize a text into 3 key points — opens a form.")
+# ─── AI ORACLE ────────────────────────────────────────────────────────────────
+
+@bot.tree.command(name="summarize",    description="Elysian: Break down any text into Key Pillars & Definitions — opens a form.")
 async def summarize(interaction: discord.Interaction):
     await interaction.response.send_modal(SummarizeModal())
 
+@bot.tree.command(name="ask",          description="Elysian: Ask the Oracle any academic question — opens a form.")
+async def ask(interaction: discord.Interaction):
+    await interaction.response.send_modal(AskModal())
+
+# ─── ACCOUNTABILITY ───────────────────────────────────────────────────────────
+
+@bot.tree.command(name="task",         description="Elysian: Commit to a daily task — opens a form.")
+async def task(interaction: discord.Interaction):
+    await interaction.response.send_modal(TaskModal())
+
+# ─── RESOURCE VAULT ───────────────────────────────────────────────────────────
+
+@bot.tree.command(name="post_resource", description="Elysian: Submit a curated resource to the Resource Vault — opens a form.")
+async def post_resource(interaction: discord.Interaction):
+    await interaction.response.send_modal(ResourceModal())
+
 # ─── EMBED & TEMPLATES ────────────────────────────────────────────────────────
-@bot.tree.command(name="embed", description="Elysian: Build a beautiful custom embed — opens a form.")
+
+@bot.tree.command(name="embed",           description="Elysian: Build a beautiful custom embed — opens a form.")
 async def embed_builder(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(EmbedBuilderModal())
 
-@bot.tree.command(name="set_welcome", description="Elysian: Set the welcome message — opens a form.")
+@bot.tree.command(name="set_welcome",     description="Elysian: Set the welcome message — opens a form.")
 async def set_welcome(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WelcomeGoodbyeModal("welcome"))
 
-@bot.tree.command(name="set_goodbye", description="Elysian: Set the goodbye message — opens a form.")
+@bot.tree.command(name="set_goodbye",     description="Elysian: Set the goodbye message — opens a form.")
 async def set_goodbye(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WelcomeGoodbyeModal("goodbye"))
 
-@bot.tree.command(name="template_save", description="Elysian: Save a reusable embed template — opens a form.")
+@bot.tree.command(name="template_save",   description="Elysian: Save a reusable embed template — opens a form.")
 @app_commands.describe(name="Template name (e.g. Rules, Announcement)")
 async def template_save(interaction: discord.Interaction, name: str):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(TemplateSaveModal(name))
 
-@bot.tree.command(name="template_post", description="Elysian: Post a saved embed template.")
+@bot.tree.command(name="template_post",   description="Elysian: Post a saved embed template.")
 @app_commands.describe(name="Template name", channel="Channel to post in (default: current)")
 async def template_post(interaction: discord.Interaction, name: str, channel: discord.TextChannel = None):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     tmpl = gcfg(interaction.guild.id).get("templates", {}).get(name)
     if not tmpl:
         return await interaction.response.send_message(f"No template named **{name}**. Use `/template_list`.", ephemeral=True)
@@ -1326,17 +1485,14 @@ async def template_post(interaction: discord.Interaction, name: str, channel: di
         description=fill_vars(tmpl.get("description",""), interaction.user),
         color=color
     )
-    if tmpl.get("footer"):
-        em.set_footer(text=fill_vars(tmpl["footer"], interaction.user))
-    if tmpl.get("image"):
-        em.set_image(url=tmpl["image"])
+    if tmpl.get("footer"): em.set_footer(text=fill_vars(tmpl["footer"], interaction.user))
+    if tmpl.get("image"):  em.set_image(url=tmpl["image"])
     await dest.send(embed=em)
     await interaction.response.send_message(f"✅ Template **{name}** posted in {dest.mention}.", ephemeral=True)
 
-@bot.tree.command(name="template_list", description="Elysian: List all saved embed templates.")
+@bot.tree.command(name="template_list",   description="Elysian: List all saved embed templates.")
 async def template_list(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     templates = gcfg(interaction.guild.id).get("templates", {})
     if not templates:
         return await interaction.response.send_message("No templates saved yet. Use `/template_save`.", ephemeral=True)
@@ -1349,8 +1505,7 @@ async def template_list(interaction: discord.Interaction):
 @bot.tree.command(name="template_delete", description="Elysian: Delete a saved template.")
 @app_commands.describe(name="Template name to delete")
 async def template_delete(interaction: discord.Interaction, name: str):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     cfg = gcfg(interaction.guild.id)
     if name not in cfg.get("templates", {}):
         return await interaction.response.send_message(f"No template named **{name}**.", ephemeral=True)
@@ -1359,14 +1514,14 @@ async def template_delete(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(f"🗑️ Template **{name}** deleted.", ephemeral=True)
 
 # ─── SHOP ─────────────────────────────────────────────────────────────────────
+
 class ShopDropdown(discord.ui.Select):
     def __init__(self, items):
         options = [
-            discord.SelectOption(label=item["name"][:25], description=f"{item['price']} Ink — {item.get('description','')[:50]}", value=str(i), emoji="💎")
+            discord.SelectOption(label=item["name"][:25], description=f"{item['price']:,} Ink — {item.get('description','')[:50]}", value=str(i), emoji="💎")
             for i, item in enumerate(items)
         ]
         super().__init__(placeholder="✦ Browse the boutique...", min_values=1, max_values=1, options=options)
-
     async def callback(self, interaction: discord.Interaction):
         idx  = int(self.values[0])
         item = shop_db["items"][idx]
@@ -1382,26 +1537,26 @@ class ShopView(discord.ui.View):
         super().__init__(timeout=60)
         self.add_item(ShopDropdown(items))
 
-@bot.tree.command(name="shop", description="Elysian: Browse the boutique and spend your Ink.")
+@bot.tree.command(name="shop",           description="Elysian: Browse the boutique and spend your Ink.")
 async def shop(interaction: discord.Interaction):
     items = shop_db.get("items", [])
     if not items:
-        return await interaction.response.send_message("The boutique is empty. The Architect has not yet stocked the shelves.", ephemeral=True)
+        return await interaction.response.send_message("The boutique is empty. Use `/admin_add_item` to stock it.", ephemeral=True)
     em = discord.Embed(title="🛍️ The Elysian Boutique", description="Select an item to view details. Use `/buy` to purchase.", color=0x7B5EA7)
     em.set_footer(text="Elysian Prestige System • Powered by Ink")
     await interaction.response.send_message(embed=em, view=ShopView(items))
 
-@bot.tree.command(name="buy", description="Elysian: Purchase an item from the boutique — opens a form.")
+@bot.tree.command(name="buy",            description="Elysian: Purchase an item from the boutique — opens a form.")
 async def buy(interaction: discord.Interaction):
     await interaction.response.send_modal(BuyModal())
 
 @bot.tree.command(name="admin_add_item", description="Elysian: Add a new item to the boutique — opens a form.")
 async def admin_add_item(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
+    if not is_owner(interaction): return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(AddItemModal())
 
 # ─── POMODORO HELPER ──────────────────────────────────────────────────────────
+
 async def _run_pomodoro(member: discord.Member, channel: discord.TextChannel, work_m: int, break_m: int):
     try:
         study_role = discord.utils.get(member.guild.roles, name="📚 Study")
@@ -1438,6 +1593,7 @@ async def _run_pomodoro(member: discord.Member, channel: discord.TextChannel, wo
         pomodoro_tasks.pop(str(member.id), None)
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
+
 if not TOKEN:
     print("ERROR: DISCORD_TOKEN is not set.")
     exit(1)

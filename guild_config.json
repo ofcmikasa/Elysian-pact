@@ -4,9 +4,13 @@
     "shop_channel_id": 1484507661071421470,
     "leaderboard_channel_id": 1484507662921240587,
     "study_vc_ids": [
-      1484507664670261271
+      1484507664670261271,
+      1485259992503288019,
+      1485259994399244389
     ],
-    "welcome_channel_id": 1484520205609730138,
-    "general_channel_id": 1484490993800708188
+    "welcome_channel_id": 1485259973813338175,
+    "general_channel_id": 1485259980327096340,
+    "daily_goals_channel_id": 1485259982453739682,
+    "resource_vault_channel_id": 1485259984559276193
   }
 }
