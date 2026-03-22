@@ -1,16 +1,18 @@
 {
   "1484490992966176788": {
-    "vault_channel_id": 1484507659079122955,
-    "shop_channel_id": 1484507661071421470,
-    "leaderboard_channel_id": 1484507662921240587,
+    "vault_channel_id": 1485260835382100201,
+    "shop_channel_id": 1485260836883796080,
+    "leaderboard_channel_id": 1485260838939132015,
     "study_vc_ids": [
       1484507664670261271,
       1485259992503288019,
-      1485259994399244389
+      1485259994399244389,
+      1485260828293726228,
+      1485260829996875847
     ],
-    "welcome_channel_id": 1485259973813338175,
-    "general_channel_id": 1485259980327096340,
-    "daily_goals_channel_id": 1485259982453739682,
-    "resource_vault_channel_id": 1485259984559276193
+    "welcome_channel_id": 1485260810992488541,
+    "general_channel_id": 1485260816490954863,
+    "daily_goals_channel_id": 1485260818735038518,
+    "resource_vault_channel_id": 1485260820672807003
   }
 }
