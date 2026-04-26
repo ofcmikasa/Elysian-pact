@@ -66,7 +66,7 @@ if GEMINI_KEY:
         import google.generativeai as genai
 
         genai.configure(api_key=GEMINI_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        gemini_model = genai.GenerativeModel("gemini-2.5-flash")
     except Exception as e:
         print(f"Gemini init failed: {e}")
 
