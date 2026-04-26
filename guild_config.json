@@ -13,6 +13,13 @@
     "welcome_channel_id": 1485260810992488541,
     "general_channel_id": 1485260816490954863,
     "daily_goals_channel_id": 1485260818735038518,
-    "resource_vault_channel_id": 1485260820672807003
+    "resource_vault_channel_id": 1485260820672807003,
+    "welcome_template": {
+      "title": "Welcome to {server.name} \ud83c\udf37\ud83c\udf38",
+      "description": "Hello {user.mention}. You're most welcome in the server. Now we have total of {server.member}*!*",
+      "color": "7B5EA7",
+      "footer": "",
+      "image": ""
+    }
   }
 }
