@@ -2415,6 +2415,7 @@ async def _run_pomodoro(
 
 DM_MODES: dict[str, str] = {}
 DM_HISTORY: dict[str, list[tuple[str, str]]] = {}
+DM_LAST_ACTION: dict[str, float] = {}
 
 DM_PERSONAS = {
     "comeback": {
@@ -2544,6 +2545,11 @@ async def handle_dm_chat(message: discord.Message):
     text = (message.content or "").strip()
     if not text:
         return
+
+    now = time.time()
+    if now - DM_LAST_ACTION.get(uid, 0) < 2:
+        return
+    DM_LAST_ACTION[uid] = now
 
     if text.lower() in ("menu", "switch", "topic", "change topic", "reset", "start"):
         DM_MODES.pop(uid, None)
