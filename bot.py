@@ -138,12 +138,13 @@ def gcfg(guild_id: int) -> dict:
     return guild_cfg.setdefault(str(guild_id), {})
 
 
-def vault_cid(guild_id: int) -> int:
-    return gcfg(guild_id).get("vault_channel_id", 1484495219176243200)
+def vault_cid(guild_id: int):
+    return gcfg(guild_id).get("vault_channel_id")
 
 
 async def get_vault(guild: discord.Guild):
-    return guild.get_channel(vault_cid(guild.id))
+    cid = vault_cid(guild.id)
+    return guild.get_channel(cid) if cid else None
 
 
 def clean_nickname(name: str) -> str:
@@ -180,6 +181,9 @@ def streak_icon(s: int) -> str:
 
 def is_owner(interaction: discord.Interaction) -> bool:
     return interaction.user.id == OWNER_ID
+
+
+owner_only = app_commands.check(lambda i: i.user.id == OWNER_ID)
 
 
 async def auto_role(member: discord.Member, hours: float):
@@ -353,6 +357,21 @@ class Elysian(commands.Bot):
 
 
 bot = Elysian()
+
+
+@bot.tree.error
+async def _on_app_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "Access denied."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+    raise error
+
 
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
 
@@ -1337,9 +1356,14 @@ class WelcomeGoodbyeModal(discord.ui.Modal):
         )
 
 
-class TemplateSaveModal(discord.ui.Modal):
+class TemplateSaveModal(discord.ui.Modal, title="📚 Save Embed Template"):
+    tmpl_name = discord.ui.TextInput(
+        label="Template name (used to recall it)",
+        placeholder="e.g. Rules, Announcement, Welcome",
+        max_length=50,
+    )
     tmpl_title = discord.ui.TextInput(
-        label="Title", placeholder="Enter title...", max_length=256
+        label="Embed title", placeholder="Enter title...", max_length=256
     )
     tmpl_desc = discord.ui.TextInput(
         label="Description",
@@ -1350,28 +1374,27 @@ class TemplateSaveModal(discord.ui.Modal):
     tmpl_color = discord.ui.TextInput(
         label="Color (hex)", placeholder="7B5EA7", max_length=6, required=False
     )
-    tmpl_footer = discord.ui.TextInput(
-        label="Footer", placeholder="Optional...", required=False, max_length=200
-    )
     tmpl_image = discord.ui.TextInput(
         label="Image URL", placeholder="https://...", required=False
     )
 
-    def __init__(self, name: str):
-        self._name = name
-        super().__init__(title=f"Save: {name[:40]}")
-
     async def on_submit(self, interaction: discord.Interaction):
-        gcfg(interaction.guild.id).setdefault("templates", {})[self._name] = {
+        name = self.tmpl_name.value.strip()
+        if not name:
+            return await interaction.response.send_message(
+                "Template name cannot be empty.", ephemeral=True
+            )
+        gcfg(interaction.guild.id).setdefault("templates", {})[name] = {
             "title": self.tmpl_title.value,
             "description": self.tmpl_desc.value,
             "color": self.tmpl_color.value.strip().lstrip("#") or "7B5EA7",
-            "footer": self.tmpl_footer.value,
+            "footer": "",
             "image": self.tmpl_image.value.strip(),
         }
         save_json(CONFIG_FILE, guild_cfg)
         await interaction.response.send_message(
-            f"✅ Template **{self._name}** saved.", ephemeral=True
+            f"✅ Template **{name}** saved. Use `/template_post` to share it.",
+            ephemeral=True,
         )
 
 
@@ -1462,46 +1485,54 @@ class AddItemModal(discord.ui.Modal, title="🛍️ Add Shop Item"):
         )
 
 
-class BuyModal(discord.ui.Modal, title="🛍️ Purchase Item"):
-    item_name = discord.ui.TextInput(
-        label="Item name",
-        placeholder="Type the exact item name from /shop",
-        max_length=100,
+async def _purchase_item(interaction: discord.Interaction, item_idx: int):
+    """Shared purchase flow used by the shop dropdown's Buy button."""
+    items = shop_db.get("items", [])
+    if item_idx < 0 or item_idx >= len(items):
+        return await interaction.response.send_message(
+            "That item is no longer available.", ephemeral=True
+        )
+    item = items[item_idx]
+    data = get_user(str(interaction.user.id))
+    if data["ink"] < item["price"]:
+        return await interaction.response.send_message(
+            f"Not enough Ink. You have **{data['ink']:,}**, need **{item['price']:,}**.",
+            ephemeral=True,
+        )
+    data["ink"] -= item["price"]
+    save_json(USERS_FILE, users_db)
+    role = interaction.guild.get_role(item.get("role_id", 0))
+    if role:
+        try:
+            await interaction.user.add_roles(role)
+        except Exception:
+            pass
+    em = discord.Embed(
+        title="✅ Purchase Complete",
+        description=f"You acquired **{item['name']}**.",
+        color=0x57F287,
     )
+    em.add_field(name="💧 Remaining Ink", value=f"{data['ink']:,}")
+    if role:
+        em.add_field(name="🎭 Role Granted", value=role.mention)
+    await interaction.response.send_message(embed=em, ephemeral=True)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.item_name.value.strip()
-        item = next(
-            (i for i in shop_db.get("items", []) if i["name"].lower() == name.lower()),
-            None,
+
+class PurchaseButton(discord.ui.View):
+    def __init__(self, item_idx: int, price: int):
+        super().__init__(timeout=120)
+        self.item_idx = item_idx
+
+        async def _buy(interaction: discord.Interaction):
+            await _purchase_item(interaction, self.item_idx)
+
+        btn = discord.ui.Button(
+            label=f"Confirm Purchase ({price:,} Ink)",
+            style=discord.ButtonStyle.success,
+            emoji="💎",
         )
-        if not item:
-            return await interaction.response.send_message(
-                f"No item named **{name}**. Check `/shop`.", ephemeral=True
-            )
-        data = get_user(str(interaction.user.id))
-        if data["ink"] < item["price"]:
-            return await interaction.response.send_message(
-                f"Not enough Ink. You have **{data['ink']:,}**, need **{item['price']:,}**.",
-                ephemeral=True,
-            )
-        data["ink"] -= item["price"]
-        save_json(USERS_FILE, users_db)
-        role = interaction.guild.get_role(item.get("role_id", 0))
-        if role:
-            try:
-                await interaction.user.add_roles(role)
-            except Exception:
-                pass
-        em = discord.Embed(
-            title="✅ Purchase Complete",
-            description=f"You acquired **{item['name']}**.",
-            color=0x57F287,
-        )
-        em.add_field(name="💧 Remaining Ink", value=f"{data['ink']:,}")
-        if role:
-            em.add_field(name="🎭 Role Granted", value=role.mention)
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        btn.callback = _buy
+        self.add_item(btn)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1515,9 +1546,8 @@ class BuyModal(discord.ui.Modal, title="🛍️ Purchase Item"):
     name="elysian_genesis",
     description="Elysian: Build the full Library Hall server structure automatically.",
 )
+@owner_only
 async def elysian_genesis(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     cfg = gcfg(guild.id)
@@ -1668,9 +1698,8 @@ async def elysian_genesis(interaction: discord.Interaction):
 @bot.tree.command(
     name="purge", description="Elysian: Delete recent messages — opens a form."
 )
+@owner_only
 async def purge(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(PurgeModal())
 
 
@@ -1678,25 +1707,22 @@ async def purge(interaction: discord.Interaction):
     name="purge_user", description="Elysian: Delete messages from a specific user."
 )
 @app_commands.describe(user="The user to cleanse")
+@owner_only
 async def purge_user(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(PurgeUserModal(user))
 
 
 @bot.tree.command(name="nuke", description="Elysian: Wipe and recreate this channel.")
+@owner_only
 async def nuke(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(NukeModal())
 
 
 @bot.tree.command(
     name="slowmode", description="Elysian: Set slowmode delay — opens a form."
 )
+@owner_only
 async def slowmode(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(SlowmodeModal())
 
 
@@ -1705,25 +1731,22 @@ async def slowmode(interaction: discord.Interaction):
 
 @bot.tree.command(name="mute", description="Elysian: Silence a scholar — opens a form.")
 @app_commands.describe(user="The scholar to silence")
+@owner_only
 async def mute(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(MuteModal(user))
 
 
 @bot.tree.command(name="warn", description="Elysian: Issue a warning — opens a form.")
 @app_commands.describe(user="The scholar to warn")
+@owner_only
 async def warn(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WarnModal(user))
 
 
 @bot.tree.command(name="kick", description="Elysian: Remove a scholar — opens a form.")
 @app_commands.describe(user="The scholar to remove")
+@owner_only
 async def kick(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(KickModal(user))
 
 
@@ -1731,9 +1754,8 @@ async def kick(interaction: discord.Interaction, user: discord.Member):
     name="ban", description="Elysian: Exile a scholar permanently — opens a form."
 )
 @app_commands.describe(user="The scholar to exile")
+@owner_only
 async def ban(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(BanModal(user))
 
 
@@ -1741,9 +1763,8 @@ async def ban(interaction: discord.Interaction, user: discord.Member):
     name="warnings", description="Elysian: View a scholar's warning record."
 )
 @app_commands.describe(user="The scholar to inspect")
+@owner_only
 async def warnings(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     uid = str(user.id)
     if uid not in warns_db or not warns_db[uid]["warnings"]:
         return await interaction.response.send_message(
@@ -1770,9 +1791,8 @@ async def warnings(interaction: discord.Interaction, user: discord.Member):
 
 
 @bot.tree.command(name="lock", description="Elysian: Freeze the current channel.")
+@owner_only
 async def lock(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     ow = interaction.channel.overwrites_for(interaction.guild.default_role)
     ow.send_messages = False
     await interaction.channel.set_permissions(
@@ -1789,9 +1809,8 @@ async def lock(interaction: discord.Interaction):
 @bot.tree.command(
     name="lockdown_server", description="Elysian: Freeze every public channel at once."
 )
+@owner_only
 async def lockdown_server(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     locked = 0
     for ch in interaction.guild.channels:
@@ -1811,9 +1830,8 @@ async def lockdown_server(interaction: discord.Interaction):
 @bot.tree.command(
     name="unlock", description="Elysian: Restore the flow to the current channel."
 )
+@owner_only
 async def unlock(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     ow = interaction.channel.overwrites_for(interaction.guild.default_role)
     ow.send_messages = True
     await interaction.channel.set_permissions(
@@ -1834,27 +1852,24 @@ async def unlock(interaction: discord.Interaction):
     name="set_ink", description="Elysian: Set a user's Ink balance — opens a form."
 )
 @app_commands.describe(user="The scholar")
+@owner_only
 async def set_ink(interaction: discord.Interaction, user: discord.Member):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(SetInkModal(user))
 
 
 @bot.tree.command(
     name="broadcast", description="Elysian: Broadcast an announcement — opens a form."
 )
+@owner_only
 async def broadcast(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(BroadcastModal())
 
 
 @bot.tree.command(
     name="vault_view", description="Elysian: View a summary of vault events."
 )
+@owner_only
 async def vault_view(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     em = discord.Embed(title="👁️ Vault Summary", color=0x7B5EA7)
     total_warns = sum(len(v.get("warnings", [])) for v in warns_db.values())
     em.add_field(name="⚠️ Total Warnings", value=str(total_warns), inline=True)
@@ -2113,83 +2128,130 @@ async def post_resource(interaction: discord.Interaction):
 @bot.tree.command(
     name="embed", description="Elysian: Build a beautiful custom embed — opens a form."
 )
+@owner_only
 async def embed_builder(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(EmbedBuilderModal())
 
 
 @bot.tree.command(
     name="set_welcome", description="Elysian: Set the welcome message — opens a form."
 )
+@owner_only
 async def set_welcome(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WelcomeGoodbyeModal("welcome"))
 
 
 @bot.tree.command(
     name="set_goodbye", description="Elysian: Set the goodbye message — opens a form."
 )
+@owner_only
 async def set_goodbye(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(WelcomeGoodbyeModal("goodbye"))
+
+
+def _render_template(tmpl: dict, user: discord.Member) -> discord.Embed:
+    try:
+        color = int(tmpl.get("color", "7B5EA7"), 16)
+    except Exception:
+        color = 0x7B5EA7
+    em = discord.Embed(
+        title=fill_vars(tmpl.get("title", ""), user),
+        description=fill_vars(tmpl.get("description", ""), user),
+        color=color,
+    )
+    if tmpl.get("footer"):
+        em.set_footer(text=fill_vars(tmpl["footer"], user))
+    if tmpl.get("image"):
+        em.set_image(url=tmpl["image"])
+    return em
+
+
+class TemplatePostSelect(discord.ui.Select):
+    def __init__(self, names, channel: discord.TextChannel):
+        self.dest = channel
+        super().__init__(
+            placeholder="✦ Choose a template to post...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=n[:100], value=n, emoji="📜") for n in names
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        name = self.values[0]
+        tmpl = gcfg(interaction.guild.id).get("templates", {}).get(name)
+        if not tmpl:
+            return await interaction.response.send_message(
+                f"Template **{name}** no longer exists.", ephemeral=True
+            )
+        await self.dest.send(embed=_render_template(tmpl, interaction.user))
+        await interaction.response.send_message(
+            f"✅ Template **{name}** posted in {self.dest.mention}.", ephemeral=True
+        )
+
+
+class TemplateDeleteSelect(discord.ui.Select):
+    def __init__(self, names):
+        super().__init__(
+            placeholder="✦ Choose a template to delete...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=n[:100], value=n, emoji="🗑️") for n in names
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        name = self.values[0]
+        cfg = gcfg(interaction.guild.id)
+        if name in cfg.get("templates", {}):
+            del cfg["templates"][name]
+            save_json(CONFIG_FILE, guild_cfg)
+            return await interaction.response.send_message(
+                f"🗑️ Template **{name}** deleted.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            f"Template **{name}** not found.", ephemeral=True
+        )
 
 
 @bot.tree.command(
     name="template_save",
     description="Elysian: Save a reusable embed template — opens a form.",
 )
-@app_commands.describe(name="Template name (e.g. Rules, Announcement)")
-async def template_save(interaction: discord.Interaction, name: str):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
-    await interaction.response.send_modal(TemplateSaveModal(name))
+@owner_only
+async def template_save(interaction: discord.Interaction):
+    await interaction.response.send_modal(TemplateSaveModal())
 
 
 @bot.tree.command(
-    name="template_post", description="Elysian: Post a saved embed template."
+    name="template_post",
+    description="Elysian: Post a saved embed template — choose from menu.",
 )
-@app_commands.describe(
-    name="Template name", channel="Channel to post in (default: current)"
-)
+@app_commands.describe(channel="Channel to post in (default: current)")
+@owner_only
 async def template_post(
-    interaction: discord.Interaction, name: str, channel: discord.TextChannel = None
+    interaction: discord.Interaction, channel: discord.TextChannel = None
 ):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
-    tmpl = gcfg(interaction.guild.id).get("templates", {}).get(name)
-    if not tmpl:
+    templates = gcfg(interaction.guild.id).get("templates", {})
+    if not templates:
         return await interaction.response.send_message(
-            f"No template named **{name}**. Use `/template_list`.", ephemeral=True
+            "No templates saved yet. Use `/template_save`.", ephemeral=True
         )
     dest = channel or interaction.channel
-    try:
-        color = int(tmpl.get("color", "7B5EA7"), 16)
-    except Exception:
-        color = 0x7B5EA7
-    em = discord.Embed(
-        title=fill_vars(tmpl.get("title", ""), interaction.user),
-        description=fill_vars(tmpl.get("description", ""), interaction.user),
-        color=color,
-    )
-    if tmpl.get("footer"):
-        em.set_footer(text=fill_vars(tmpl["footer"], interaction.user))
-    if tmpl.get("image"):
-        em.set_image(url=tmpl["image"])
-    await dest.send(embed=em)
+    view = discord.ui.View(timeout=120)
+    view.add_item(TemplatePostSelect(list(templates.keys()), dest))
     await interaction.response.send_message(
-        f"✅ Template **{name}** posted in {dest.mention}.", ephemeral=True
+        f"Select a template to post in {dest.mention}:", view=view, ephemeral=True
     )
 
 
 @bot.tree.command(
     name="template_list", description="Elysian: List all saved embed templates."
 )
+@owner_only
 async def template_list(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     templates = gcfg(interaction.guild.id).get("templates", {})
     if not templates:
         return await interaction.response.send_message(
@@ -2200,26 +2262,25 @@ async def template_list(interaction: discord.Interaction):
         em.add_field(
             name=f"• {name}", value=t.get("title", "*(no title)*")[:80], inline=False
         )
-    em.set_footer(text="Use /template_post [name] to post one.")
+    em.set_footer(text="Use /template_post to share one.")
     await interaction.response.send_message(embed=em, ephemeral=True)
 
 
 @bot.tree.command(
-    name="template_delete", description="Elysian: Delete a saved template."
+    name="template_delete",
+    description="Elysian: Delete a saved template — choose from menu.",
 )
-@app_commands.describe(name="Template name to delete")
-async def template_delete(interaction: discord.Interaction, name: str):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
-    cfg = gcfg(interaction.guild.id)
-    if name not in cfg.get("templates", {}):
+@owner_only
+async def template_delete(interaction: discord.Interaction):
+    templates = gcfg(interaction.guild.id).get("templates", {})
+    if not templates:
         return await interaction.response.send_message(
-            f"No template named **{name}**.", ephemeral=True
+            "No templates to delete.", ephemeral=True
         )
-    del cfg["templates"][name]
-    save_json(CONFIG_FILE, guild_cfg)
+    view = discord.ui.View(timeout=120)
+    view.add_item(TemplateDeleteSelect(list(templates.keys())))
     await interaction.response.send_message(
-        f"🗑️ Template **{name}** deleted.", ephemeral=True
+        "Choose a template to delete:", view=view, ephemeral=True
     )
 
 
@@ -2257,8 +2318,11 @@ class ShopDropdown(discord.ui.Select):
         em.add_field(
             name="Reward", value=role.mention if role else "Special Perk", inline=True
         )
-        em.set_footer(text="Use /buy to purchase.")
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        data = get_user(str(interaction.user.id))
+        em.set_footer(text=f"You have {data['ink']:,} Ink.")
+        await interaction.response.send_message(
+            embed=em, view=PurchaseButton(idx, item["price"]), ephemeral=True
+        )
 
 
 class ShopView(discord.ui.View):
@@ -2278,7 +2342,7 @@ async def shop(interaction: discord.Interaction):
         )
     em = discord.Embed(
         title="🛍️ The Elysian Boutique",
-        description="Select an item to view details. Use `/buy` to purchase.",
+        description="Select an item to view details and purchase with one click.",
         color=0x7B5EA7,
     )
     em.set_footer(text="Elysian Prestige System • Powered by Ink")
@@ -2286,20 +2350,11 @@ async def shop(interaction: discord.Interaction):
 
 
 @bot.tree.command(
-    name="buy",
-    description="Elysian: Purchase an item from the boutique — opens a form.",
-)
-async def buy(interaction: discord.Interaction):
-    await interaction.response.send_modal(BuyModal())
-
-
-@bot.tree.command(
     name="admin_add_item",
     description="Elysian: Add a new item to the boutique — opens a form.",
 )
+@owner_only
 async def admin_add_item(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        return await interaction.response.send_message("Access denied.", ephemeral=True)
     await interaction.response.send_modal(AddItemModal())
 
 
