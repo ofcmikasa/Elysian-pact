@@ -2406,6 +2406,95 @@ async def _run_pomodoro(
         pomodoro_tasks.pop(str(member.id), None)
 
 
+# ─── HELP ─────────────────────────────────────────────────────────────────────
+
+MEMBER_COMMANDS = [
+    ("/profile", "View your scholar profile card."),
+    ("/leaderboard", "See the top scholars by study hours."),
+    ("/daily", "Collect your daily Ink blessing."),
+    ("/focus", "Start a focus session and earn Ink."),
+    ("/endfocus", "End your focus session and claim Ink."),
+    ("/pomodoro", "Begin a Pomodoro work/break timer."),
+    ("/stoppomodoro", "Cancel your active Pomodoro timer."),
+    ("/deepwork", "Enter a long, distraction-free study mode."),
+    ("/task", "Commit to a daily task — opens a form."),
+    ("/post_resource", "Share a study resource with the library."),
+    ("/summarize", "Let Elysian's oracle summarise text for you."),
+    ("/ask", "Ask Elysian's oracle a question."),
+    ("/shop", "Browse the boutique and spend your Ink."),
+]
+
+ADMIN_COMMANDS = [
+    ("/elysian_genesis", "Bootstrap the server's roles & channels."),
+    ("/broadcast", "Post a server-wide announcement."),
+    ("/embed", "Build a beautiful custom embed."),
+    ("/set_welcome", "Set the welcome message."),
+    ("/set_goodbye", "Set the goodbye message."),
+    ("/template_save", "Save a reusable embed template."),
+    ("/template_post", "Post a saved template (dropdown)."),
+    ("/template_list", "List all saved templates."),
+    ("/template_delete", "Delete a saved template (dropdown)."),
+    ("/admin_add_item", "Add a new item to the boutique."),
+    ("/set_ink", "Adjust a scholar's Ink balance."),
+    ("/mute", "Silence a scholar — opens a form."),
+    ("/warn", "Issue a warning — opens a form."),
+    ("/warnings", "View a scholar's warning record."),
+    ("/kick", "Remove a scholar — opens a form."),
+    ("/ban", "Exile a scholar permanently."),
+    ("/purge", "Delete recent messages."),
+    ("/purge_user", "Delete messages from a specific user."),
+    ("/nuke", "Wipe and recreate this channel."),
+    ("/slowmode", "Set slowmode delay."),
+    ("/lock", "Freeze the current channel."),
+    ("/unlock", "Unfreeze the current channel."),
+    ("/lockdown_server", "Freeze every public channel at once."),
+    ("/vault_view", "View the vault's moderation log."),
+]
+
+
+def _help_embed(is_admin: bool) -> discord.Embed:
+    em = discord.Embed(
+        title="📖 Elysian's Grimoire — Command Codex",
+        description=(
+            "Every command opens a form, dropdown, or button — no typing required.\n"
+            "*Browse the categories below to find what you need.*"
+        ),
+        color=0x7B5EA7,
+    )
+    member_lines = "\n".join(f"**`{n}`** — {d}" for n, d in MEMBER_COMMANDS)
+    em.add_field(
+        name=f"🎓 Scholar Commands · For Everyone ({len(MEMBER_COMMANDS)})",
+        value=member_lines,
+        inline=False,
+    )
+    if is_admin:
+        admin_lines = "\n".join(f"**`{n}`** — {d}" for n, d in ADMIN_COMMANDS)
+        em.add_field(
+            name=f"🛡️ Guardian Commands · Owner Only ({len(ADMIN_COMMANDS)})",
+            value=admin_lines,
+            inline=False,
+        )
+    else:
+        em.add_field(
+            name="🛡️ Guardian Commands · Owner Only",
+            value="*These commands are reserved for the Library's keeper.*",
+            inline=False,
+        )
+    em.set_footer(
+        text=f"Total: {len(MEMBER_COMMANDS) + len(ADMIN_COMMANDS)} commands · ✦ Elysian, Guardian of the Library"
+    )
+    return em
+
+
+@bot.tree.command(
+    name="help", description="Elysian: Reveal the full grimoire of commands."
+)
+async def help_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=_help_embed(is_owner(interaction)), ephemeral=True
+    )
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 if not TOKEN:
