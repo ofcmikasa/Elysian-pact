@@ -2408,72 +2408,92 @@ async def _run_pomodoro(
 
 # ─── HELP ─────────────────────────────────────────────────────────────────────
 
-MEMBER_COMMANDS = [
-    ("/profile", "View your scholar profile card."),
-    ("/leaderboard", "See the top scholars by study hours."),
-    ("/daily", "Collect your daily Ink blessing."),
-    ("/focus", "Start a focus session and earn Ink."),
-    ("/endfocus", "End your focus session and claim Ink."),
-    ("/pomodoro", "Begin a Pomodoro work/break timer."),
-    ("/stoppomodoro", "Cancel your active Pomodoro timer."),
-    ("/deepwork", "Enter a long, distraction-free study mode."),
-    ("/task", "Commit to a daily task — opens a form."),
-    ("/post_resource", "Share a study resource with the library."),
-    ("/summarize", "Let Elysian's oracle summarise text for you."),
-    ("/ask", "Ask Elysian's oracle a question."),
-    ("/shop", "Browse the boutique and spend your Ink."),
+MEMBER_GROUPS = [
+    ("📊 Profile & Economy", [
+        ("/profile", "View your scholar profile card."),
+        ("/leaderboard", "See the top scholars by study hours."),
+        ("/daily", "Collect your daily Ink blessing."),
+        ("/shop", "Browse the boutique and spend your Ink."),
+    ]),
+    ("📚 Study & Focus", [
+        ("/focus", "Start a focus session and earn Ink."),
+        ("/endfocus", "End your focus session and claim Ink."),
+        ("/pomodoro", "Begin a Pomodoro work/break timer."),
+        ("/stoppomodoro", "Cancel your active Pomodoro timer."),
+        ("/deepwork", "Enter a long, distraction-free study mode."),
+        ("/task", "Commit to a daily task."),
+        ("/post_resource", "Share a study resource."),
+    ]),
+    ("🔮 Oracle (AI)", [
+        ("/ask", "Ask Elysian's oracle a question."),
+        ("/summarize", "Let the oracle summarise text for you."),
+    ]),
 ]
 
-ADMIN_COMMANDS = [
-    ("/elysian_genesis", "Bootstrap the server's roles & channels."),
-    ("/broadcast", "Post a server-wide announcement."),
-    ("/embed", "Build a beautiful custom embed."),
-    ("/set_welcome", "Set the welcome message."),
-    ("/set_goodbye", "Set the goodbye message."),
-    ("/template_save", "Save a reusable embed template."),
-    ("/template_post", "Post a saved template (dropdown)."),
-    ("/template_list", "List all saved templates."),
-    ("/template_delete", "Delete a saved template (dropdown)."),
-    ("/admin_add_item", "Add a new item to the boutique."),
-    ("/set_ink", "Adjust a scholar's Ink balance."),
-    ("/mute", "Silence a scholar — opens a form."),
-    ("/warn", "Issue a warning — opens a form."),
-    ("/warnings", "View a scholar's warning record."),
-    ("/kick", "Remove a scholar — opens a form."),
-    ("/ban", "Exile a scholar permanently."),
-    ("/purge", "Delete recent messages."),
-    ("/purge_user", "Delete messages from a specific user."),
-    ("/nuke", "Wipe and recreate this channel."),
-    ("/slowmode", "Set slowmode delay."),
-    ("/lock", "Freeze the current channel."),
-    ("/unlock", "Unfreeze the current channel."),
-    ("/lockdown_server", "Freeze every public channel at once."),
-    ("/vault_view", "View the vault's moderation log."),
+ADMIN_GROUPS = [
+    ("⚙️ Server Setup", [
+        ("/elysian_genesis", "Bootstrap roles & channels."),
+        ("/broadcast", "Post a server-wide announcement."),
+        ("/embed", "Build a beautiful custom embed."),
+        ("/set_welcome", "Set the welcome message."),
+        ("/set_goodbye", "Set the goodbye message."),
+    ]),
+    ("📜 Embed Templates", [
+        ("/template_save", "Save a reusable embed template."),
+        ("/template_post", "Post a saved template (dropdown)."),
+        ("/template_list", "List all saved templates."),
+        ("/template_delete", "Delete a saved template (dropdown)."),
+    ]),
+    ("💎 Economy Admin", [
+        ("/admin_add_item", "Add a new item to the boutique."),
+        ("/set_ink", "Adjust a scholar's Ink balance."),
+    ]),
+    ("⚖️ Moderation", [
+        ("/mute", "Silence a scholar."),
+        ("/warn", "Issue a warning."),
+        ("/warnings", "View a scholar's warning record."),
+        ("/kick", "Remove a scholar."),
+        ("/ban", "Exile a scholar permanently."),
+        ("/purge", "Delete recent messages."),
+        ("/purge_user", "Delete a specific user's messages."),
+        ("/nuke", "Wipe and recreate this channel."),
+        ("/slowmode", "Set slowmode delay."),
+    ]),
+    ("🔒 Channel Control", [
+        ("/lock", "Freeze the current channel."),
+        ("/unlock", "Unfreeze the current channel."),
+        ("/lockdown_server", "Freeze every public channel."),
+        ("/vault_view", "View the vault's moderation log."),
+    ]),
 ]
+
+
+def _format_group(cmds):
+    return "\n".join(f"**`{n}`** — {d}" for n, d in cmds)
 
 
 def _help_embed(is_admin: bool) -> discord.Embed:
+    member_total = sum(len(c) for _, c in MEMBER_GROUPS)
+    admin_total = sum(len(c) for _, c in ADMIN_GROUPS)
     em = discord.Embed(
         title="📖 Elysian's Grimoire — Command Codex",
         description=(
             "Every command opens a form, dropdown, or button — no typing required.\n"
-            "*Browse the categories below to find what you need.*"
+            f"**🎓 Scholar Commands** *(for everyone, {member_total} total)*"
         ),
         color=0x7B5EA7,
     )
-    member_lines = "\n".join(f"**`{n}`** — {d}" for n, d in MEMBER_COMMANDS)
-    em.add_field(
-        name=f"🎓 Scholar Commands · For Everyone ({len(MEMBER_COMMANDS)})",
-        value=member_lines,
-        inline=False,
-    )
+    for title, cmds in MEMBER_GROUPS:
+        em.add_field(name=title, value=_format_group(cmds), inline=False)
+
     if is_admin:
-        admin_lines = "\n".join(f"**`{n}`** — {d}" for n, d in ADMIN_COMMANDS)
         em.add_field(
-            name=f"🛡️ Guardian Commands · Owner Only ({len(ADMIN_COMMANDS)})",
-            value=admin_lines,
+            name="\u200b",
+            value=f"**🛡️ Guardian Commands** *(owner only, {admin_total} total)*",
             inline=False,
         )
+        for title, cmds in ADMIN_GROUPS:
+            em.add_field(name=title, value=_format_group(cmds), inline=False)
     else:
         em.add_field(
             name="🛡️ Guardian Commands · Owner Only",
@@ -2481,7 +2501,7 @@ def _help_embed(is_admin: bool) -> discord.Embed:
             inline=False,
         )
     em.set_footer(
-        text=f"Total: {len(MEMBER_COMMANDS) + len(ADMIN_COMMANDS)} commands · ✦ Elysian, Guardian of the Library"
+        text=f"Total: {member_total + admin_total} commands · ✦ Elysian, Guardian of the Library"
     )
     return em
 
