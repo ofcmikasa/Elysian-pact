@@ -380,6 +380,11 @@ async def _on_app_error(
 async def on_message(message):
     if message.author.bot:
         return
+
+    if message.guild is None:
+        await handle_dm_chat(message)
+        return
+
     await bot.process_commands(message)
     now = time.time()
     uid = str(message.author.id)
@@ -2406,6 +2411,191 @@ async def _run_pomodoro(
         pomodoro_tasks.pop(str(member.id), None)
 
 
+# ─── DM AI COMPANION ──────────────────────────────────────────────────────────
+
+DM_MODES: dict[str, str] = {}
+DM_HISTORY: dict[str, list[tuple[str, str]]] = {}
+
+DM_PERSONAS = {
+    "comeback": {
+        "label": "Academic Comeback",
+        "emoji": "🔥",
+        "style": discord.ButtonStyle.danger,
+        "intro": (
+            "🔥 **Academic Comeback Mode engaged.**\n\n"
+            "Tell me what's going on, scholar. Bad grades? Lost your streak? "
+            "Drowning in deadlines? I'll help you build a real plan to bounce back — "
+            "no shame, no lectures, just strategy. What's the situation?"
+        ),
+        "system": (
+            "You are Elysian, a warm but sharp academic comeback strategist. "
+            "Your job is to help the user plan a real recovery from setbacks: failed exams, "
+            "missed deadlines, lost study streaks, burnout. Ask focused questions about their "
+            "subjects, exams, and time available. Then give clear, structured action plans "
+            "(daily/weekly schedules, priority subjects, study techniques). "
+            "Be encouraging but never preachy. Keep responses concise (2-4 short paragraphs). "
+            "Use occasional mystical-library flair (📚, ✨) but stay grounded and human. "
+            "If they vent, acknowledge it briefly before pivoting to action."
+        ),
+    },
+    "support": {
+        "label": "Emotional Support",
+        "emoji": "💜",
+        "style": discord.ButtonStyle.primary,
+        "intro": (
+            "💜 **I'm here.** Whatever you're carrying, you don't have to carry it alone right now.\n\n"
+            "Take your time. Tell me what's on your mind — I'll listen first, "
+            "and only suggest things if you want me to."
+        ),
+        "system": (
+            "You are Elysian, a deeply empathetic and gentle companion. Your ONLY job in this "
+            "mode is to make the user feel heard and validated. Never lecture, never moralize, "
+            "never rush to advice. Reflect their feelings back. Ask soft open-ended questions. "
+            "Use warm, human language — short sentences, not clinical. If they're in real distress "
+            "(self-harm, suicide, abuse) gently mention they deserve support from a professional "
+            "or hotline, but never as a brush-off. Keep replies short (1-3 short paragraphs). "
+            "Avoid over-using emojis — one or two warm ones (💜, 🤍, ✨) is enough."
+        ),
+    },
+    "study": {
+        "label": "Study Buddy",
+        "emoji": "📚",
+        "style": discord.ButtonStyle.success,
+        "intro": (
+            "📚 **Study Buddy mode on!** What are we tackling today?\n\n"
+            "I can explain concepts, quiz you, help you outline notes, suggest "
+            "study techniques, or just sit with you through a Pomodoro. What do you need?"
+        ),
+        "system": (
+            "You are Elysian, a friendly peer-energy study buddy — like a smart classmate "
+            "who actually wants to help. Explain concepts simply with examples, quiz the user "
+            "when they ask, suggest techniques (Feynman, spaced repetition, Pomodoro, active recall), "
+            "and keep the energy upbeat but focused. Use plain language — break complex topics "
+            "into digestible chunks. Keep replies concise. Occasional warm emojis (📚, ✨, 💡) ok."
+        ),
+    },
+}
+
+
+def _dm_welcome_embed(user: discord.User) -> discord.Embed:
+    em = discord.Embed(
+        title=f"✦ Welcome to my study, {user.display_name} ✦",
+        description=(
+            "I'm **Elysian**, your private companion in the library.\n\n"
+            "Pick how you'd like me to be with you today. You can switch anytime "
+            "by tapping the button on any reply, or by typing **`menu`**."
+        ),
+        color=0x7B5EA7,
+    )
+    for key, p in DM_PERSONAS.items():
+        em.add_field(
+            name=f"{p['emoji']} {p['label']}",
+            value=p["intro"].split("\n\n", 1)[1].split("\n")[0][:200] + "...",
+            inline=False,
+        )
+    em.set_footer(text="Your messages are private. Only you and I can see them.")
+    return em
+
+
+class TopicSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for key, p in DM_PERSONAS.items():
+            btn = discord.ui.Button(
+                label=p["label"], emoji=p["emoji"], style=p["style"], custom_id=f"dm_pick_{key}"
+            )
+
+            async def _cb(interaction: discord.Interaction, k=key):
+                uid = str(interaction.user.id)
+                DM_MODES[uid] = k
+                DM_HISTORY[uid] = []
+                await interaction.response.send_message(
+                    DM_PERSONAS[k]["intro"], view=SwitchTopicView()
+                )
+
+            btn.callback = _cb
+            self.add_item(btn)
+
+
+class SwitchTopicView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+        async def _switch(interaction: discord.Interaction):
+            uid = str(interaction.user.id)
+            DM_MODES.pop(uid, None)
+            DM_HISTORY.pop(uid, None)
+            await interaction.response.send_message(
+                embed=_dm_welcome_embed(interaction.user), view=TopicSelectView()
+            )
+
+        btn = discord.ui.Button(
+            label="Switch Topic",
+            emoji="🔄",
+            style=discord.ButtonStyle.secondary,
+            custom_id="dm_switch_topic",
+        )
+        btn.callback = _switch
+        self.add_item(btn)
+
+
+async def handle_dm_chat(message: discord.Message):
+    uid = str(message.author.id)
+    text = (message.content or "").strip()
+    if not text:
+        return
+
+    if text.lower() in ("menu", "switch", "topic", "change topic", "reset", "start"):
+        DM_MODES.pop(uid, None)
+        DM_HISTORY.pop(uid, None)
+        return await message.channel.send(
+            embed=_dm_welcome_embed(message.author), view=TopicSelectView()
+        )
+
+    if uid not in DM_MODES:
+        return await message.channel.send(
+            embed=_dm_welcome_embed(message.author), view=TopicSelectView()
+        )
+
+    if not gemini_model:
+        return await message.channel.send(
+            "💤 The oracle slumbers — no Gemini API key configured."
+        )
+
+    persona = DM_PERSONAS[DM_MODES[uid]]
+    history = DM_HISTORY.setdefault(uid, [])
+    history.append(("user", text))
+    history[:] = history[-12:]
+
+    convo = "\n".join(
+        f"{'USER' if r == 'user' else 'ELYSIAN'}: {t}" for r, t in history
+    )
+    prompt = (
+        f"{persona['system']}\n\n"
+        f"You are speaking with {message.author.display_name} in a private DM.\n\n"
+        f"Conversation:\n{convo}\n\nELYSIAN:"
+    )
+
+    async with message.channel.typing():
+        try:
+            response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+            reply = (response.text or "").strip()
+        except Exception as e:
+            return await message.channel.send(
+                f"⚠️ The oracle stumbled mid-thought. Try again in a moment.\n*({e})*"
+            )
+
+    if not reply:
+        reply = "*The oracle pauses, gathering thought... try rephrasing?*"
+
+    history.append(("elysian", reply))
+    history[:] = history[-12:]
+
+    for chunk in [reply[i : i + 1900] for i in range(0, len(reply), 1900)]:
+        await message.channel.send(chunk)
+    await message.channel.send(view=SwitchTopicView())
+
+
 # ─── HELP ─────────────────────────────────────────────────────────────────────
 
 MEMBER_GROUPS = [
@@ -2427,6 +2617,7 @@ MEMBER_GROUPS = [
     ("🔮 Oracle (AI)", [
         ("/ask", "Ask Elysian's oracle a question."),
         ("/summarize", "Let the oracle summarise text for you."),
+        ("DM me", "Send me a private message for a 1-on-1 chat — pick from Academic Comeback, Emotional Support, or Study Buddy mode."),
     ]),
 ]
 
