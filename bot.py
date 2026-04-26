@@ -22,6 +22,15 @@ OWNER_ID = 1456572804815261858
 class _ReuseServer(HTTPServer):
     allow_reuse_address = True
 
+    def server_bind(self):
+        # Force SO_REUSEADDR + SO_REUSEPORT so restarts don't get blocked by TIME_WAIT
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        super().server_bind()
+
 
 class _Ping(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -34,8 +43,14 @@ class _Ping(BaseHTTPRequestHandler):
         pass
 
 
-def _start_keep_alive(port: int = 8080):
-    server = _ReuseServer(("0.0.0.0", port), _Ping)
+def _start_keep_alive(port: int | None = None):
+    # Render (and other PaaS hosts) inject a PORT env var. Fall back to 8080 for local/Replit.
+    port = port or int(os.environ.get("PORT", 8080))
+    try:
+        server = _ReuseServer(("0.0.0.0", port), _Ping)
+    except OSError as e:
+        print(f"⚠️  Keep-alive port {port} unavailable ({e}); bot will run without it.")
+        return
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"✧ Keep-alive server running on port {port}")
 
