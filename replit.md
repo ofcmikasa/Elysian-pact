@@ -43,3 +43,17 @@ npm run dev
 ```
 
 Serves on port 5000.
+
+## Bot (bot.py)
+
+Runs on Render (live: elysian-pact.onrender.com). 51 slash commands across:
+- **Profile/Economy** — /profile (with Comeback Card overlay), /leaderboard, /daily, /shop
+- **Study/Focus** — /focus, /endfocus (x3 Final Stand multiplier, burnout lock at 180 min/day, raid damage), /pomodoro, /deepwork, /task, /post_resource
+- **High-Stakes** — /vow (Ink Pact w/ ante + deadline + daily goal), /end_vow, /shame_board, /gambit (bet → x3), /quit_gambit, /duel (PvP trivia), /raid_status
+- **Oracle (AI)** — /ask, /summarize, /oracle_challenge (Socratic 3-turn), /simplify (ELI5), /critique (harsh prof), /quiz_me (5-Q one-shot, Sage badge for perfect / -50 Ink for 0), /ledger (weakness heat map), DM chat (3 personas)
+- **Admin** — /elysian_genesis, /broadcast, /embed, welcome/goodbye, templates, /set_ink, /admin_add_item, /raid_start (owner)
+- **Moderation** — /mute, /warn, /warnings, /kick, /ban, /purge, /purge_user, /nuke, /slowmode, /lock, /unlock, /lockdown_server, /vault_view
+
+Background loops: vow_morning_check (10:00 UTC nudges) and vow_midnight_check (burns Ink for missed daily goal, posts public shame, expires vows + raids).
+
+Data files: users.json, sessions.json, shop.json, guild_config.json, vault.json, templates.json, vows.json, ledger.json, raid.json.
