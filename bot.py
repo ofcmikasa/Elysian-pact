@@ -1847,152 +1847,286 @@ class PurchaseButton(discord.ui.View):
 
 @bot.tree.command(
     name="elysian_genesis",
-    description="Elysian: Build the full Library Hall server structure automatically.",
+    description="Elysian: Wipe the server and rebuild it with the Prestige v2 template.",
 )
 @owner_only
 async def elysian_genesis(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    cfg = gcfg(guild.id)
-
-    # ── Roles ──────────────────────────────────────────────────────
-    role_specs = [
-        ("10h Scholar", discord.Color.from_str("#C0C0C0")),
-        ("50h Sage", discord.Color.from_str("#4169E1")),
-        ("100h Immortal", discord.Color.from_str("#FFD700")),
-        ("Honor Society", discord.Color.from_str("#E74C3C")),
-        ("Library VIP", discord.Color.from_str("#9B59B6")),
-        ("The Architect's Favorite", discord.Color.from_str("#FF8C00")),
-        ("📚 Study", discord.Color.from_str("#7B5EA7")),
-    ]
-    for name, color in role_specs:
-        if not discord.utils.get(guild.roles, name=name):
-            await guild.create_role(name=name, color=color, reason="Elysian Genesis")
-
-    # ── Category: 🏁 START HERE ────────────────────────────────────
-    cat_start = discord.utils.get(
-        guild.categories, name="🏁 START HERE"
-    ) or await guild.create_category("🏁 START HERE")
-
-    rules_ch = discord.utils.get(
-        guild.text_channels, name="📜-rules-and-info"
-    ) or await guild.create_text_channel("📜-rules-and-info", category=cat_start)
-    announce_ch = discord.utils.get(
-        guild.text_channels, name="📢-announcements"
-    ) or await guild.create_text_channel("📢-announcements", category=cat_start)
-    cfg["welcome_channel_id"] = rules_ch.id
-
-    # ── Category: 📝 THE STUDY HALL ────────────────────────────────
-    cat_study = discord.utils.get(
-        guild.categories, name="📝 THE STUDY HALL"
-    ) or await guild.create_category("📝 THE STUDY HALL")
-
-    general_ch = discord.utils.get(
-        guild.text_channels, name="💬-general-study"
-    ) or await guild.create_text_channel("💬-general-study", category=cat_study)
-    goals_ch = discord.utils.get(
-        guild.text_channels, name="✅daily-goals"
-    ) or await guild.create_text_channel("✅daily-goals", category=cat_study)
-    resource_ch = discord.utils.get(
-        guild.text_channels, name="📚resource-vault"
-    ) or await guild.create_text_channel("📚resource-vault", category=cat_study)
-    bot_ch = discord.utils.get(
-        guild.text_channels, name="🤖bot-commands"
-    ) or await guild.create_text_channel("🤖bot-commands", category=cat_study)
-    pomo_ch = discord.utils.get(
-        guild.text_channels, name="🍅pomodoro-bot"
-    ) or await guild.create_text_channel("🍅pomodoro-bot", category=cat_study)
-
-    cfg["general_channel_id"] = general_ch.id
-    cfg["daily_goals_channel_id"] = goals_ch.id
-    cfg["resource_vault_channel_id"] = resource_ch.id
-
-    # ── Category: 🔇 FOCUS ZONES ───────────────────────────────────
-    cat_focus = discord.utils.get(
-        guild.categories, name="🔇 FOCUS ZONES"
-    ) or await guild.create_category("🔇 FOCUS ZONES")
-
-    lofi_vc = discord.utils.get(
-        guild.voice_channels, name="🎧lofi-library"
-    ) or await guild.create_voice_channel("🎧lofi-library", category=cat_focus)
-    cam_vc = discord.utils.get(
-        guild.voice_channels, name="🎥cam-study"
-    ) or await guild.create_voice_channel("🎥cam-study", category=cat_focus)
-    break_vc = discord.utils.get(
-        guild.voice_channels, name="☕the-breakroom"
-    ) or await guild.create_voice_channel("☕the-breakroom", category=cat_focus)
-
-    cfg.setdefault("study_vc_ids", [])
-    for vc in [lofi_vc, cam_vc]:
-        if vc.id not in cfg["study_vc_ids"]:
-            cfg["study_vc_ids"].append(vc.id)
-
-    # ── Category: ✧ ELYSIAN PRESTIGE ✧ ────────────────────────────
-    cat_pres = discord.utils.get(
-        guild.categories, name="✧ ELYSIAN PRESTIGE ✧"
-    ) or await guild.create_category("✧ ELYSIAN PRESTIGE ✧")
-
-    vault_ch = discord.utils.get(guild.text_channels, name="vault-logs")
-    if not vault_ch:
-        ow = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            guild.me: discord.PermissionOverwrite(
-                read_messages=True, send_messages=True
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="✧ Elysian Genesis v2 — Confirm Wipe ✧",
+            description=(
+                "This will **DELETE every channel and category** in this server, then rebuild "
+                "the **Prestige v2** template:\n\n"
+                "**5 Categories** — The Archives • Ritual Grounds • Study Sanctum • The Economy • Guardian Overlook\n"
+                "**10 Channels** — clean, sleek, no emoji clutter\n"
+                "**22 Roles** — Administrative → Vowed → Scholar Ranks → Specialty Titles → Cosmetic Prestige\n\n"
+                "*Member messages are not affected. Existing roles you keep won't be removed; missing "
+                "roles will be created in correct hierarchy.*"
             ),
-        }
-        owner = guild.get_member(OWNER_ID)
-        if owner:
-            ow[owner] = discord.PermissionOverwrite(
-                read_messages=True, send_messages=False
-            )
-        vault_ch = await guild.create_text_channel(
-            "vault-logs", category=cat_pres, overwrites=ow
+            color=0x7B5EA7,
+        ),
+        view=GenesisConfirmView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+# ─── ELYSIAN GENESIS v2 — PRESTIGE TEMPLATE ──────────────────────────────────
+
+
+PRESTIGE_ROLES_TOP_DOWN = [
+    # ─ ADMINISTRATIVE ─
+    ("The Guardian", 0xE74C3C, discord.Permissions(administrator=True), True),
+    ("Keeper of the Grimoire", 0xC0392B,
+     discord.Permissions(manage_guild=True, manage_roles=True, manage_channels=True), True),
+    ("The Scribe", 0xE67E22,
+     discord.Permissions(manage_messages=True, moderate_members=True), True),
+    # ─ THE VOWED (HIGH STAKES) ─
+    ("The Vowed", 0x8B0000, discord.Permissions(change_nickname=True), True),
+    ("Apostate", 0x4A4A4A, discord.Permissions.none(), False),
+    ("Martyr", 0xFFD700, discord.Permissions(priority_speaker=True), True),
+    ("The Indebted", 0x2C2F33, discord.Permissions.none(), False),
+    # ─ SCHOLAR RANKS (PROGRESSION) ─
+    ("Eminent Sage", 0xF1C40F,
+     discord.Permissions(external_emojis=True, create_public_threads=True), True),
+    ("Grand Scholar", 0x9B59B6, discord.Permissions(mention_everyone=True), True),
+    ("High Scholar", 0x3498DB, discord.Permissions(attach_files=True), True),
+    ("Scholar", 0x5DADE2, discord.Permissions.none(), True),
+    ("Apprentice", 0x95A5A6, discord.Permissions(use_voice_activation=True), False),
+    ("Novice", 0xBDC3C7, discord.Permissions.none(), False),
+    # ─ SPECIALTY TITLES (ACHIEVEMENTS) ─
+    ("Oracle's Favorite", 0x7B5EA7, discord.Permissions.none(), True),
+    ("Night Owl", 0x2C3E50, discord.Permissions.none(), True),
+    ("Deep Worker", 0x16A085, discord.Permissions.none(), True),
+    ("Duelist", 0xC0392B, discord.Permissions.none(), True),
+    ("Librarian", 0x6D4C41, discord.Permissions.none(), True),
+    # ─ COSMETIC PRESTIGE (SHOP ROLES) ─
+    ("Ink-Stained", 0x1A1A2E, discord.Permissions.none(), False),
+    ("Spectral", 0xECF0F1, discord.Permissions.none(), True),
+    ("The Catalyst", 0xFF8C00, discord.Permissions.none(), False),
+    ("Ascended", 0xFFFFFF, discord.Permissions.none(), True),
+]
+
+
+class GenesisConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        wipe = discord.ui.Button(label="WIPE & REBUILD", style=discord.ButtonStyle.danger, emoji="⚠️")
+        cancel = discord.ui.Button(label="CANCEL", style=discord.ButtonStyle.secondary)
+        wipe.callback = self._wipe
+        cancel.callback = self._cancel
+        self.add_item(wipe)
+        self.add_item(cancel)
+
+    async def _cancel(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="🚪 Cancelled", description="No changes made.", color=0x95A5A6),
+            view=None,
         )
-    cfg["vault_channel_id"] = vault_ch.id
 
-    shop_ch = discord.utils.get(
-        guild.text_channels, name="elysian-shop"
-    ) or await guild.create_text_channel("elysian-shop", category=cat_pres)
-    lb_ch = discord.utils.get(
-        guild.text_channels, name="leaderboard-hall"
-    ) or await guild.create_text_channel("leaderboard-hall", category=cat_pres)
-    cfg["shop_channel_id"] = shop_ch.id
-    cfg["leaderboard_channel_id"] = lb_ch.id
+    async def _wipe(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("Only the invoker can confirm.", ephemeral=True)
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🛠️ Building the Library…",
+                description="Wiping channels, then building roles & rebuilding the Prestige v2 template.\n*This may take 30–60 seconds.*",
+                color=0x7B5EA7,
+            ),
+            view=None,
+        )
 
-    save_json(CONFIG_FILE, guild_cfg)
+        guild = interaction.guild
+        operator = interaction.user
 
-    em = discord.Embed(
-        title="✧ Elysian Library Hall — Genesis Complete ✧",
-        color=0x7B5EA7,
-        description="The full server infrastructure has been built.",
-    )
-    em.add_field(
-        name="🏁 START HERE",
-        value=f"• {rules_ch.mention}\n• {announce_ch.mention}",
-        inline=False,
-    )
-    em.add_field(
-        name="📝 STUDY HALL",
-        value=f"• {general_ch.mention}\n• {goals_ch.mention}\n• {resource_ch.mention}\n• {bot_ch.mention}\n• {pomo_ch.mention}",
-        inline=False,
-    )
-    em.add_field(
-        name="🔇 FOCUS ZONES",
-        value=f"• 🎧 lofi-library (VC)\n• 🎥 cam-study (VC)\n• ☕ the-breakroom (VC)",
-        inline=False,
-    )
-    em.add_field(
-        name="✧ PRESTIGE",
-        value=f"• {vault_ch.mention}\n• {shop_ch.mention}\n• {lb_ch.mention}",
-        inline=False,
-    )
-    em.add_field(
-        name="🎭 Roles Created",
-        value="\n".join(f"• {n}" for n, _ in role_specs),
-        inline=False,
-    )
-    em.set_footer(text="Elysian Prestige System • The Library Hall is open.")
-    await interaction.followup.send(embed=em, ephemeral=True)
+        # ── 1. Wipe all channels & categories ─────────────────────
+        for ch in list(guild.channels):
+            try:
+                await ch.delete(reason="Elysian Genesis v2 — clean wipe")
+            except Exception:
+                pass
+
+        # ── 2. Build/find 22 prestige roles in display order ──────
+        # New roles always land just above @everyone, so creating
+        # in top-down order naturally stacks them correctly.
+        role_objs: dict[str, discord.Role] = {}
+        for name, color, perms, hoist in PRESTIGE_ROLES_TOP_DOWN:
+            existing = discord.utils.get(guild.roles, name=name)
+            if existing:
+                role_objs[name] = existing
+                continue
+            try:
+                r = await guild.create_role(
+                    name=name,
+                    colour=discord.Colour(color),
+                    permissions=perms,
+                    hoist=hoist,
+                    mentionable=False,
+                    reason="Elysian Genesis v2",
+                )
+                role_objs[name] = r
+            except Exception:
+                pass
+
+        guardian_role = role_objs.get("The Guardian")
+        keeper_role = role_objs.get("Keeper of the Grimoire")
+        scribe_role = role_objs.get("The Scribe")
+        vowed_role = role_objs.get("The Vowed")
+        apostate_role = role_objs.get("Apostate")
+        indebted_role = role_objs.get("The Indebted")
+
+        # Permission overwrite presets ──────────────────────────────
+        def view_only_overwrites():
+            ow = {guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False)}
+            ow[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            for r in (guardian_role, keeper_role, scribe_role):
+                if r:
+                    ow[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            return ow
+
+        def open_overwrites(deny_apostate: bool = False, deny_indebted: bool = False):
+            ow = {}
+            if deny_apostate and apostate_role:
+                ow[apostate_role] = discord.PermissionOverwrite(send_messages=False, add_reactions=False)
+            if deny_indebted and indebted_role:
+                ow[indebted_role] = discord.PermissionOverwrite(send_messages=False, add_reactions=False)
+            return ow
+
+        def admin_only_overwrites():
+            ow = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            }
+            for r in (guardian_role, keeper_role):
+                if r:
+                    ow[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            return ow
+
+        # ── 3. Build categories & channels ────────────────────────
+        cfg = gcfg(guild.id)
+        created: list[tuple[str, discord.TextChannel]] = []
+
+        async def mk_cat(name: str) -> discord.CategoryChannel:
+            return await guild.create_category(name, reason="Elysian Genesis v2")
+
+        async def mk_text(cat, name, overwrites=None, topic=None):
+            ch = await guild.create_text_channel(name, category=cat, overwrites=overwrites or {}, topic=topic)
+            created.append((name, ch))
+            return ch
+
+        # ── ─ THE ARCHIVES ─ ──
+        archives = await mk_cat("─ THE ARCHIVES ─")
+        rules = await mk_text(archives, "rules-and-info", view_only_overwrites(),
+                              "The Grimoire — server guidelines.")
+        announcements = await mk_text(archives, "announcements", view_only_overwrites(),
+                                       "Global pings and bot updates.")
+
+        # ── ─ RITUAL GROUNDS ─ ──
+        ritual = await mk_cat("─ RITUAL GROUNDS ─")
+        the_vow = await mk_text(ritual, "the-vow", open_overwrites(),
+                                 "Sign the Ink Pact. Use /vow to begin a High-Stakes Comeback.")
+        the_arena = await mk_text(ritual, "the-arena", open_overwrites(deny_indebted=True),
+                                   "High-intensity /duel sessions and active recall battles.")
+        hall_of_shame = await mk_text(ritual, "hall-of-shame", view_only_overwrites(),
+                                       "Automated logs of broken contracts and lost Ink.")
+
+        # ── ─ STUDY SANCTUM ─ ──
+        sanctum = await mk_cat("─ STUDY SANCTUM ─")
+        oracle_consults = await mk_text(sanctum, "oracle-consults", open_overwrites(),
+                                         "/ask, /simplify, /summarize, /critique.")
+        focus_hub = await mk_text(sanctum, "focus-hub", open_overwrites(),
+                                   "/focus, /deepwork, /pomodoro.")
+        resource_vault = await mk_text(sanctum, "resource-vault", view_only_overwrites(),
+                                        "Curated study materials. Use /post_resource to contribute.")
+
+        # ── ─ THE ECONOMY ─ ──
+        economy = await mk_cat("─ THE ECONOMY ─")
+        leaderboard = await mk_text(economy, "leaderboard-hall", view_only_overwrites(),
+                                     "Top scholars by study hours and Ink.")
+        shop = await mk_text(economy, "elysian-shop", open_overwrites(deny_apostate=True),
+                              "Spend Ink on roles or perks. /shop")
+
+        # ── ─ GUARDIAN OVERLOOK ─ ──
+        overlook = await mk_cat("─ GUARDIAN OVERLOOK ─")
+        vault_logs = await mk_text(overlook, "vault-logs", admin_only_overwrites(),
+                                    "Behind-the-scenes tracking of stakes, mod actions, and bot errors.")
+
+        # ── 4. Wire config ────────────────────────────────────────
+        cfg["welcome_channel_id"] = rules.id
+        cfg["general_channel_id"] = focus_hub.id
+        cfg["daily_goals_channel_id"] = the_vow.id
+        cfg["resource_vault_channel_id"] = resource_vault.id
+        cfg["shop_channel_id"] = shop.id
+        cfg["leaderboard_channel_id"] = leaderboard.id
+        cfg["vault_channel_id"] = vault_logs.id
+        cfg["arena_channel_id"] = the_arena.id
+        cfg["shame_channel_id"] = hall_of_shame.id
+        cfg["oracle_channel_id"] = oracle_consults.id
+        cfg["announcements_channel_id"] = announcements.id
+        save_json(CONFIG_FILE, guild_cfg)
+
+        # ── 5. Welcome banner in #rules-and-info ──────────────────
+        try:
+            await rules.send(embed=discord.Embed(
+                title="✧ Welcome to the Library ✧",
+                description=(
+                    "*Five halls. One discipline. The Library remembers everything.*\n\n"
+                    "**─ THE ARCHIVES ─** Rules and announcements.\n"
+                    "**─ RITUAL GROUNDS ─** Vows, duels, and the price of failure.\n"
+                    "**─ STUDY SANCTUM ─** Where the work is done.\n"
+                    "**─ THE ECONOMY ─** Ink earned. Ink spent.\n"
+                    "**─ GUARDIAN OVERLOOK ─** What the Guardians see.\n\n"
+                    "Type **/help** to begin."
+                ),
+                color=0x7B5EA7,
+            ))
+        except Exception:
+            pass
+
+        # ── 6. Completion DM (channel was wiped, can't followup) ──
+        em = discord.Embed(
+            title="✧ Elysian Genesis v2 — Complete ✧",
+            description="The Library has been rebuilt in its Prestige form.",
+            color=0x7B5EA7,
+        )
+        em.add_field(
+            name="─ THE ARCHIVES ─",
+            value=f"• {rules.mention}\n• {announcements.mention}",
+            inline=False,
+        )
+        em.add_field(
+            name="─ RITUAL GROUNDS ─",
+            value=f"• {the_vow.mention}\n• {the_arena.mention}\n• {hall_of_shame.mention}",
+            inline=False,
+        )
+        em.add_field(
+            name="─ STUDY SANCTUM ─",
+            value=f"• {oracle_consults.mention}\n• {focus_hub.mention}\n• {resource_vault.mention}",
+            inline=False,
+        )
+        em.add_field(
+            name="─ THE ECONOMY ─",
+            value=f"• {leaderboard.mention}\n• {shop.mention}",
+            inline=False,
+        )
+        em.add_field(
+            name="─ GUARDIAN OVERLOOK ─",
+            value=f"• {vault_logs.mention} (admin only)",
+            inline=False,
+        )
+        em.add_field(
+            name=f"🎭 Roles ({len(role_objs)}/22)",
+            value=" • ".join(role_objs.keys()),
+            inline=False,
+        )
+        em.set_footer(text="Auto-rank logic active: scholars are promoted by study_hours.")
+        try:
+            await operator.send(embed=em)
+        except Exception:
+            try:
+                await rules.send(embed=em)
+            except Exception:
+                pass
 
 
 # ─── CLEANSE ──────────────────────────────────────────────────────────────────
